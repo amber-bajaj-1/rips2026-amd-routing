@@ -12,10 +12,11 @@ PhysicalNetlist. It provides exactly two runtime-selectable SSSP engines:
 On the AMD University Program image:
 
 ```bash
-chmod +x setup-tpe.sh
-./setup-tpe.sh /home/jovyan
-source /home/jovyan/rips2026-amd-routing/environment.sh
-cd /home/jovyan/rips2026-amd-routing
+HOME_DIRECTORY="${HOME}"
+chmod +x setup.sh
+./setup.sh "$HOME_DIRECTORY"
+source "$HOME_DIRECTORY/rips2026-amd-routing/environment.sh"
+cd "$HOME_DIRECTORY/rips2026-amd-routing"
 make pipeline
 make device-graph
 ```
