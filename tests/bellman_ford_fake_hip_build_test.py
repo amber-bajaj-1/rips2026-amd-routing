@@ -47,13 +47,32 @@ def select_compiler() -> str:
     configured = os.environ.get("BELLMAN_FORD_FAKE_HIP_CXX")
     if configured:
         return configured
+
     compiler = shutil.which("clang++")
-    require(
-        compiler is not None,
+    if compiler is not None:
+        return compiler
+
+    rocm_roots: list[Path] = []
+    configured_rocm = os.environ.get("ROCM_PATH")
+    if configured_rocm:
+        rocm_roots.append(Path(configured_rocm))
+
+    hipcc = shutil.which("hipcc")
+    if hipcc is not None:
+        rocm_root = Path(hipcc).resolve().parent.parent
+        if rocm_root not in rocm_roots:
+            rocm_roots.append(rocm_root)
+
+    for rocm_root in rocm_roots:
+        rocm_compiler = rocm_root / "llvm/bin/clang++"
+        if rocm_compiler.is_file() and os.access(rocm_compiler, os.X_OK):
+            return str(rocm_compiler)
+
+    raise RuntimeError(
         "Bellman-Ford fake-HIP normal-atomic coverage requires clang++; "
-        "set BELLMAN_FORD_FAKE_HIP_CXX to a compatible compiler",
+        "install clang, set ROCM_PATH to a ROCm installation, or set "
+        "BELLMAN_FORD_FAKE_HIP_CXX to a compatible compiler"
     )
-    return compiler
 
 
 def require_atomic_load_builtin(compiler: str) -> None:
