@@ -25,7 +25,7 @@ inline bool sssp_all_targets_reached(const SsspCsrResult& result,
          std::isfinite(result.target_distance);
 }
 
-struct CertifiedSsspOutcome {
+struct SsspFallbackOutcome {
   SsspCsrResult result;
   bool used_unbounded_retry = false;
 };
@@ -34,19 +34,21 @@ struct CertifiedSsspOutcome {
 // one engine-neutral policy. The caller supplies the engine invocation and is
 // responsible for resetting/reusing its workspace correctly between calls.
 template <typename Run>
-CertifiedSsspOutcome run_with_optional_unbounded_fallback(
+SsspFallbackOutcome run_with_optional_unbounded_fallback(
     const RoutingQueryBounds& initial_bounds,
     bool unbounded_fallback,
     std::size_t target_count,
     Run&& run) {
-  CertifiedSsspOutcome outcome;
+  SsspFallbackOutcome outcome;
   outcome.result = run(initial_bounds);
+  outcome.used_unbounded_retry = outcome.result.used_unbounded_retry;
   const bool bounded_failure =
       !sssp_result_certified(outcome.result) ||
       !sssp_all_targets_reached(outcome.result, target_count);
   if (initial_bounds.enabled && unbounded_fallback && bounded_failure) {
     outcome.used_unbounded_retry = true;
     outcome.result = run(RoutingQueryBounds{});
+    outcome.result.used_unbounded_retry = true;
   }
   return outcome;
 }

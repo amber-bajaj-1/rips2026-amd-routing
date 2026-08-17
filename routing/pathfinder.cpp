@@ -1,8 +1,7 @@
 #include "pathfinder.hpp"
 
-#include "../bellman_ford/bf11_worker_policy.hpp"
+#include "../bellman_ford/bellman_ford_worker_policy.hpp"
 #include "../pre-process/import_policy.hpp"
-#include "../sssp/roctx_ranges.hpp"
 
 // One-shot shortest-path router for the repository PathFinder flow.
 //
@@ -15,11 +14,10 @@
      routing/pathfinder.cpp \
      routing/csr_artifact.cpp \
      delta_stepping/delta_stepping.cpp \
-     bellman_ford/bf11.cpp \
+     bellman_ford/bellman_ford.cpp \
      -pthread \
      -o pathfinder
 */
-// Add -DPATHFINDER_ENABLE_ROCTX -lrocprofiler-sdk-roctx for profiler ranges.
 //
 // Run:
 //   ./pathfinder design.csrbin design.csrbin.ifmeta.bin --net-limit 10
@@ -42,6 +40,7 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -49,15 +48,26 @@ namespace routing {
 namespace {
 
 constexpr char METADATA_MAGIC[8] = {'R', 'I', 'P', 'S', 'I', 'F', 'M', '1'};
-constexpr std::uint64_t LEGACY_METADATA_VERSION = 4;
-constexpr std::uint64_t FIRST_PAIRED_METADATA_VERSION = 5;
-constexpr std::uint64_t CURRENT_METADATA_VERSION = 6;
+constexpr std::uint64_t METADATA_VERSION = 8;
 constexpr std::uint64_t EXPECTED_OUTGOING_EDGE_ORIENTATION = 2;
 
-struct PipDataDisk {
+struct CompactPipDataDisk {
+  std::uint32_t wire0_string = 0;
+  std::uint32_t wire1_string = 0;
+  std::uint32_t forward = 0;
+};
+
+struct EndpointPipDisk {
+  std::uint64_t csr_edge = 0;
+  std::uint64_t from = 0;
+  std::uint64_t to = 0;
+  std::uint64_t tile_string = 0;
   std::uint64_t wire0_string = 0;
   std::uint64_t wire1_string = 0;
   std::uint64_t forward = 0;
+  std::uint64_t site_string = 0;
+  std::uint64_t endpoint_node = 0;
+  std::uint64_t role = 0;
 };
 
 struct SitePinNodeDisk {
@@ -66,14 +76,18 @@ struct SitePinNodeDisk {
   std::uint64_t pin_string = 0;
 };
 
-static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint64_t),
+static_assert(sizeof(EdgeAttr) == 2 * sizeof(std::uint32_t),
               "EdgeAttr metadata layout changed");
 static_assert(std::is_trivially_copyable<EdgeAttr>::value,
               "EdgeAttr must remain bulk-readable");
-static_assert(sizeof(PipDataDisk) == 3 * sizeof(std::uint64_t),
+static_assert(sizeof(CompactPipDataDisk) == 3 * sizeof(std::uint32_t),
               "PipData disk layout changed");
-static_assert(std::is_trivially_copyable<PipDataDisk>::value,
+static_assert(std::is_trivially_copyable<CompactPipDataDisk>::value,
               "PipData disk records must remain bulk-readable");
+static_assert(sizeof(EndpointPipDisk) == 10 * sizeof(std::uint64_t),
+              "endpoint-PIP disk layout changed");
+static_assert(std::is_trivially_copyable<EndpointPipDisk>::value,
+              "endpoint-PIP disk records must remain bulk-readable");
 static_assert(sizeof(SitePinNodeDisk) == 3 * sizeof(std::uint64_t),
               "site-pin disk layout changed");
 static_assert(std::is_trivially_copyable<SitePinNodeDisk>::value,
@@ -100,6 +114,15 @@ int route_node_from_disk(std::uint64_t raw, const char* name) {
 
 int read_route_node(std::ifstream& in, const char* name) {
   return route_node_from_disk(read_u64(in, name), name);
+}
+
+minplus_sparse::Offset route_edge_from_disk(std::uint64_t raw,
+                                            const char* name) {
+  if (raw > static_cast<std::uint64_t>(
+                std::numeric_limits<minplus_sparse::Offset>::max())) {
+    throw std::runtime_error(std::string(name) + " exceeds CSR edge range");
+  }
+  return static_cast<minplus_sparse::Offset>(raw);
 }
 
 template <typename T>
@@ -161,7 +184,7 @@ void skip_array(std::ifstream& in, std::uint64_t count, const char* name) {
   skip_bytes(in, sssp_capacity::checked_bytes<T>(host_count), name);
 }
 
-void require_position_within_file(std::ifstream& in, const char* name) {
+void require_position_at_end_of_file(std::ifstream& in, const char* name) {
   const std::ifstream::pos_type position = in.tellg();
   if (position == std::ifstream::pos_type(-1)) {
     throw std::runtime_error(std::string("failed while checking ") + name);
@@ -171,8 +194,9 @@ void require_position_within_file(std::ifstream& in, const char* name) {
     throw std::runtime_error(std::string("failed while checking ") + name);
   }
   const std::ifstream::pos_type end = in.tellg();
-  if (end == std::ifstream::pos_type(-1) || position > end) {
-    throw std::runtime_error(std::string(name) + " is truncated");
+  if (end == std::ifstream::pos_type(-1) || position != end) {
+    throw std::runtime_error(std::string(name) +
+                             " has trailing or missing bytes");
   }
 }
 
@@ -233,10 +257,16 @@ void validate_csr_shape(const HostCsrF32& graph) {
   }
 }
 
+bool is_supported_bellman_ford_segment_rounds(int rounds) noexcept {
+  return rounds == 1 || rounds == 2 || rounds == 4 || rounds == 8 ||
+         rounds == 16;
+}
+
 void validate_options(const PathfinderOptions& options) {
   validate_bounds_config(options.bounds);
-  if (options.target_check_interval <= 0) {
-    throw std::invalid_argument("target-check interval must be positive");
+  if (options.bellman_ford_target_check_interval <= 0) {
+    throw std::invalid_argument(
+        "Bellman-Ford target-check interval must be positive");
   }
   if (options.capacity <= 0) {
     throw std::invalid_argument("capacity must be positive");
@@ -245,12 +275,33 @@ void validate_options(const PathfinderOptions& options) {
     throw std::invalid_argument(
         "max SSSP iterations must be -1 or nonnegative");
   }
+  if (!is_supported_bellman_ford_segment_rounds(options.bellman_ford_segment_rounds)) {
+    throw std::invalid_argument(
+        "Bellman-Ford segment rounds must be one of 1, 2, 4, 8, or 16");
+  }
+  switch (options.bellman_ford_hip_graph_mode) {
+    case BellmanFordHipGraphMode::kAuto:
+    case BellmanFordHipGraphMode::kOn:
+    case BellmanFordHipGraphMode::kOff:
+      break;
+    default:
+      throw std::invalid_argument("invalid Bellman-Ford HIP Graph mode");
+  }
+  if (!(options.bellman_ford_adaptive_reset_threshold > 0.0) ||
+      options.bellman_ford_adaptive_reset_threshold > 1.0 ||
+      !std::isfinite(options.bellman_ford_adaptive_reset_threshold)) {
+    throw std::invalid_argument(
+        "Bellman-Ford adaptive reset threshold must be finite and in (0, 1]");
+  }
   switch (options.sssp_engine) {
     case SsspEngine::kDeltaStep:
-      if (options.bellman_ford_telemetry ||
-          options.target_check_interval != 1) {
+      if (options.bellman_ford_diagnostics ||
+          options.bellman_ford_target_check_interval != 1 ||
+          options.bellman_ford_segment_rounds != 1 ||
+          options.bellman_ford_hip_graph_mode != BellmanFordHipGraphMode::kAuto ||
+          options.bellman_ford_adaptive_reset_threshold != 0.25) {
         throw std::invalid_argument(
-            "BF11 target-check/telemetry controls cannot be applied to "
+            "Bellman-Ford controls cannot be applied to "
             "Delta-Stepping");
       }
       break;
@@ -258,6 +309,7 @@ void validate_options(const PathfinderOptions& options) {
       if (options.delta != 1.0f || options.delta_auto ||
           options.delta_multiplier != 1.0f || options.delta_telemetry ||
           options.delta_force_legacy_parent ||
+          options.delta_force_generic ||
           options.delta_controller_mode !=
               DeltaSteppingCsrControllerMode::kHostChecked ||
           options.delta_controller_batch_size !=
@@ -529,10 +581,10 @@ SsspCsrResult run_workspace_sssp(
     float delta,
     int max_iterations,
     const RoutingQueryBounds& bounds,
-    int target_check_interval,
+    int bellman_ford_target_check_interval,
     hipStream_t stream,
     DeltaSteppingCsrTelemetry* telemetry) {
-  (void)target_check_interval;
+  (void)bellman_ford_target_check_interval;
   DeltaSteppingCsrRunOptions run_options;
   run_options.telemetry = telemetry;
   run_options.routing_bounds = bounds;
@@ -547,22 +599,22 @@ SsspCsrResult run_workspace_sssp(
 }
 
 SsspCsrResult run_workspace_sssp(
-    BellmanFord11CsrWorkspace& workspace,
+    BellmanFordCsrWorkspace& workspace,
     const std::vector<int>& sources,
     const std::vector<int>& targets,
     float delta,
     int max_iterations,
     const RoutingQueryBounds& bounds,
-    int target_check_interval,
+    int bellman_ford_target_check_interval,
     hipStream_t stream,
     DeltaSteppingCsrTelemetry* telemetry) {
   if (telemetry != nullptr) {
     throw std::invalid_argument(
         "Delta telemetry is unavailable for Bellman-Ford");
   }
-  BellmanFord11RunOptions run_options;
+  BellmanFordRunOptions run_options;
   run_options.bounds = bounds;
-  run_options.target_check_interval = target_check_interval;
+  run_options.target_check_interval = bellman_ford_target_check_interval;
   return workspace.run(sources, targets, delta, max_iterations, run_options,
                        stream, nullptr, nullptr);
 }
@@ -768,7 +820,6 @@ RoutedNet route_net(const HostCsrF32& graph,
                     hipStream_t stream,
                     std::vector<DeltaSteppingCsrTelemetry>* delta_telemetry =
                         nullptr) {
-  PATHFINDER_PROFILE_RANGE("pathfinder.route_net");
   RoutedNet net;
   net.net_string = request.net_string;
   if (tree_seen.size() != static_cast<std::size_t>(graph.rows)) {
@@ -824,8 +875,9 @@ RoutedNet route_net(const HostCsrF32& graph,
           routing_sidecars->route_end_x.empty() ||
           routing_sidecars->route_end_y.empty()) {
         throw std::runtime_error(
-            "bounded routing requires CSR v3 route-end coordinate sidecars; "
-            "regenerate the CSR or select --unbounded/--bf11-unbounded");
+            "bounded routing requires CSR v4 route-end coordinate sidecars; "
+            "regenerate the CSR with interchange_to_csr or select "
+            "--unbounded");
       }
       bounds_derivation = derive_query_bounds(
           routing_sidecars->route_end_x, routing_sidecars->route_end_y,
@@ -838,7 +890,6 @@ RoutedNet route_net(const HostCsrF32& graph,
 
     const auto invoke_sssp = [&](const RoutingQueryBounds& bounds) {
       DeltaSteppingCsrTelemetry invocation_telemetry;
-      PATHFINDER_PROFILE_RANGE("pathfinder.sssp");
       SsspCsrResult invocation = run_workspace_sssp(
           workspace,
           source_candidates,
@@ -846,7 +897,7 @@ RoutedNet route_net(const HostCsrF32& graph,
           options.delta,
           options.max_sssp_iterations,
           bounds,
-          options.target_check_interval,
+          options.bellman_ford_target_check_interval,
           stream,
           delta_telemetry == nullptr ? nullptr : &invocation_telemetry);
       if (delta_telemetry != nullptr && invocation_telemetry.collected) {
@@ -855,7 +906,10 @@ RoutedNet route_net(const HostCsrF32& graph,
       return invocation;
     };
 
-    CertifiedSsspOutcome outcome = run_with_optional_unbounded_fallback(
+    // PathFinder owns the single engine-neutral retry. Low-level engine retry
+    // controls remain available to direct callers but are deliberately left
+    // disabled by run_workspace_sssp().
+    SsspFallbackOutcome outcome = run_with_optional_unbounded_fallback(
         bounds_derivation.bounds,
         options.bounds.unbounded_fallback,
         initial_targets.size(),
@@ -1130,10 +1184,12 @@ void select_worker_device(int device) {
 
 std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
                                          std::size_t route_request_count,
-                                         hipStream_t stream) {
+                                         hipStream_t stream,
+                                         bool exact_unit_eligible) {
   if (stream != nullptr || rows <= 0 || route_request_count <= 1) {
     return 1;
   }
+  (void)exact_unit_eligible;
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
   std::size_t free_bytes = 0;
@@ -1143,13 +1199,15 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
   }
   (void)total_bytes;
 
-  // The immutable CSR has already been uploaded once and is reflected in
-  // free_bytes. The PathFinder wrapper always runs classic generic
-  // Delta-Stepping, whose workspace includes membership flags, bucket queues,
-  // touched state, and race-safe parent keys. Vertex costs are lazy and
-  // PathFinder never installs them. Leave a reserve for query and compact path
-  // buffers.
-  constexpr std::size_t bytes_per_vertex_budget = 60;
+  // The immutable shared CSR is already reflected in free_bytes. Exact-unit
+  // workers retain an append-only frontier, distances, target multiplicities,
+  // and predecessor state (~24 B/vertex). Generic workers retain bucket,
+  // membership, touched, and parent state (~60 B/vertex). Leave a fixed
+  // reserve for per-query targets and compact paths.
+  const std::size_t bytes_per_vertex_budget =
+      exact_unit_eligible
+          ? kDeltaSteppingCsrExactUnitWorkspaceBytesPerVertex
+          : kDeltaSteppingCsrGenericWorkspaceBytesPerVertex;
   constexpr std::size_t kPerWorkerReserve = 64ULL * 1024ULL * 1024ULL;
   constexpr std::size_t kMaxAutoWorkers = 8;
   const std::size_t row_count = static_cast<std::size_t>(rows);
@@ -1180,26 +1238,27 @@ std::size_t recommend_delta_worker_count(minplus_sparse::Offset rows,
 #endif
 }
 
-struct Bf11WorkerRecommendation {
-  bf11_worker_policy::Recommendation policy;
+struct BellmanFordWorkerRecommendation {
+  bellman_ford_worker_policy::Recommendation policy;
+  bellman_ford_worker_policy::WorkspaceDeviceBytesEstimate workspace_bytes;
   std::size_t peak_workspace_device_bytes_estimate = 0;
   std::size_t free_device_bytes = 0;
   std::string device_architecture;
   int compute_unit_count = 0;
 };
 
-Bf11WorkerRecommendation recommend_bf11_worker_count(
+BellmanFordWorkerRecommendation recommend_bellman_ford_worker_count(
     minplus_sparse::Offset rows,
     const SsspQueryCapacityHints& capacity_hints,
     std::size_t route_request_count,
     hipStream_t stream,
-    bool telemetry_enabled) {
-  Bf11WorkerRecommendation result;
+    bool diagnostics_enabled) {
+  BellmanFordWorkerRecommendation result;
   if (rows <= 0) return result;
+  result.workspace_bytes = bellman_ford_worker_policy::estimate_workspace_device_bytes(
+      static_cast<std::size_t>(rows), capacity_hints, diagnostics_enabled);
   result.peak_workspace_device_bytes_estimate =
-      bf11_worker_policy::automatic_worker_device_bytes_estimate(
-          static_cast<std::size_t>(rows), capacity_hints.max_sources,
-          capacity_hints.max_targets, telemetry_enabled);
+      result.workspace_bytes.identity_automatic_peak_device_bytes;
 
 #if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
   std::size_t total_device_bytes = 0;
@@ -1224,13 +1283,14 @@ Bf11WorkerRecommendation recommend_bf11_worker_count(
 
   const std::size_t cpu_threads =
       std::max<unsigned int>(1, std::thread::hardware_concurrency());
-  result.policy = bf11_worker_policy::recommend(
+  result.policy = bellman_ford_worker_policy::recommend(
       {route_request_count,
        cpu_threads,
        result.free_device_bytes,
        result.peak_workspace_device_bytes_estimate,
        result.device_architecture,
-       result.compute_unit_count});
+       result.compute_unit_count,
+       bellman_ford_worker_policy::WorkspaceCostStorageMode::kIdentity});
   if (stream != nullptr) result.policy.worker_count = 1;
   return result;
 }
@@ -1247,6 +1307,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
                                    std::vector<RoutedNet>& nets,
                                    const std::shared_ptr<SharedGraph>& shared_graph,
                                    const WorkspaceOptions& workspace_options,
+                                   const SsspQueryCapacityHints& capacity_hints,
                                    std::vector<std::vector<DeltaSteppingCsrTelemetry>>*
                                        delta_telemetry_records = nullptr) {
   if (delta_telemetry_records != nullptr &&
@@ -1261,8 +1322,18 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     worker_count = 1;
   }
 
+  const auto make_workspace = [&](hipStream_t worker_stream) {
+    if constexpr (std::is_same_v<Workspace,
+                                 BellmanFordCsrWorkspace>) {
+      return Workspace(shared_graph, worker_stream, workspace_options,
+                       capacity_hints);
+    } else {
+      return Workspace(shared_graph, worker_stream, workspace_options);
+    }
+  };
+
   if (worker_count <= 1 || route_request_count <= 1) {
-    Workspace sssp_workspace(shared_graph, stream, workspace_options);
+    Workspace sssp_workspace = make_workspace(stream);
     std::vector<std::uint32_t> route_tree_seen(static_cast<std::size_t>(base_graph.rows), 0);
     std::vector<int> route_parent_by_child(static_cast<std::size_t>(base_graph.rows), -1);
     std::vector<std::uint32_t> route_parent_seen(static_cast<std::size_t>(base_graph.rows), 0);
@@ -1330,7 +1401,7 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
       select_worker_device(worker_device);
       WorkerStream worker_stream(stream == nullptr);
       hipStream_t local_stream = worker_stream.get(stream);
-      Workspace sssp_workspace(shared_graph, local_stream, workspace_options);
+      Workspace sssp_workspace = make_workspace(local_stream);
       std::vector<std::uint32_t> route_tree_seen(
           static_cast<std::size_t>(base_graph.rows), 0);
       std::vector<int> route_parent_by_child(
@@ -1417,6 +1488,11 @@ struct DeltaTelemetryTotals {
   std::array<std::uint64_t, 4> path_counts{};
   std::array<std::uint64_t, 2> effective_controller_counts{};
   std::uint64_t controller_fallback_queries = 0;
+  std::uint64_t force_generic_queries = 0;
+  std::uint64_t bounded_queries = 0;
+  std::uint64_t unbounded_queries = 0;
+  std::uint64_t unknown_coordinate_nodes = 0;
+  std::vector<RoutingQueryBounds> bounds_samples;
   DeltaSteppingCsrTelemetry sums;
   std::uint64_t current_queue_high_water = 0;
   std::uint64_t pending_queue_high_water = 0;
@@ -1459,6 +1535,20 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
     if (record.controller_fallback) {
       ++totals.controller_fallback_queries;
     }
+    if (record.force_generic) ++totals.force_generic_queries;
+    if (record.bounds_enabled) {
+      ++totals.bounded_queries;
+      if (totals.bounds_samples.size() < 8) {
+        totals.bounds_samples.push_back(
+            {true, record.bounds_min_x, record.bounds_max_x,
+             record.bounds_min_y, record.bounds_max_y});
+      }
+    } else {
+      ++totals.unbounded_queries;
+    }
+    totals.unknown_coordinate_nodes =
+        std::max(totals.unknown_coordinate_nodes,
+                 record.bounds_unknown_coordinate_nodes);
     totals.sums.outer_buckets_processed +=
         record.outer_buckets_processed;
     totals.sums.light_relaxation_rounds +=
@@ -1472,6 +1562,7 @@ DeltaTelemetryTotals aggregate_delta_telemetry(
         record.stale_frontier_entries;
     totals.sums.light_edge_visits += record.light_edge_visits;
     totals.sums.heavy_edge_visits += record.heavy_edge_visits;
+    totals.sums.bounds_rejected_edges += record.bounds_rejected_edges;
     totals.sums.distance_atomic_attempts +=
         record.distance_atomic_attempts;
     totals.sums.successful_distance_relaxations +=
@@ -1511,13 +1602,17 @@ std::string delta_telemetry_aggregate_json(
     const PathfinderOptions& options,
     float resolved_delta,
     int wavefront_size,
-    std::size_t worker_count) {
-  const DeltaTelemetryTotals totals = aggregate_delta_telemetry(records);
+    std::size_t worker_count,
+    std::uint64_t graph_unknown_coordinate_nodes) {
+  DeltaTelemetryTotals totals = aggregate_delta_telemetry(records);
+  totals.unknown_coordinate_nodes =
+      std::max(totals.unknown_coordinate_nodes,
+               graph_unknown_coordinate_nodes);
   const DeltaSteppingCsrTelemetry& sums = totals.sums;
   std::ostringstream out;
   out.precision(std::numeric_limits<float>::max_digits10);
   out << "{\"type\":\"delta_stepping_telemetry\""
-      << ",\"schema_version\":2"
+      << ",\"schema_version\":4"
       << ",\"scope\":\"pathfinder_run\""
       << ",\"queries\":" << totals.queries
       << ",\"completed_queries\":" << totals.completed_queries
@@ -1526,9 +1621,11 @@ std::string delta_telemetry_aggregate_json(
       << ",\"parallel_workers\":" << worker_count
       << ",\"delta_auto\":" << (options.delta_auto ? "true" : "false")
       << ",\"delta_multiplier\":" << options.delta_multiplier
-      << ",\"force_generic\":true"
+      << ",\"force_generic\":"
+      << (options.delta_force_generic ? "true" : "false")
       << ",\"force_legacy_parent\":"
       << (options.delta_force_legacy_parent ? "true" : "false")
+      << ",\"force_generic_queries\":" << totals.force_generic_queries
       << ",\"controller_mode\":\""
       << (options.delta_controller_mode ==
                   DeltaSteppingCsrControllerMode::kReducedRoundTrip
@@ -1549,7 +1646,24 @@ std::string delta_telemetry_aggregate_json(
       << ",\"compact_generic\":" << totals.path_counts[1]
       << ",\"legacy_generic\":" << totals.path_counts[2]
       << ",\"generic_distances_only\":" << totals.path_counts[3]
-      << "},\"counters\":{"
+      << "},\"bounds\":{"
+      << "\"configured\":" << (options.bounds.enabled ? "true" : "false")
+      << ",\"bounded_queries\":" << totals.bounded_queries
+      << ",\"unbounded_queries\":" << totals.unbounded_queries
+      << ",\"rejected_edges\":" << sums.bounds_rejected_edges
+      << ",\"unknown_coordinate_nodes\":"
+      << totals.unknown_coordinate_nodes
+      << ",\"sample_applied_rectangles\":[";
+  for (std::size_t i = 0; i < totals.bounds_samples.size(); ++i) {
+    if (i != 0) out << ',';
+    const RoutingQueryBounds& bounds = totals.bounds_samples[i];
+    out << "{\"min_x\":" << bounds.min_x
+        << ",\"max_x\":" << bounds.max_x
+        << ",\"min_y\":" << bounds.min_y
+        << ",\"max_y\":" << bounds.max_y << '}';
+  }
+  out << "]}"
+      << ",\"counters\":{"
       << "\"outer_buckets_processed\":" << sums.outer_buckets_processed
       << ",\"light_relaxation_rounds\":" << sums.light_relaxation_rounds
       << ",\"heavy_edge_phases\":" << sums.heavy_edge_phases
@@ -1560,6 +1674,7 @@ std::string delta_telemetry_aggregate_json(
       << ",\"stale_frontier_entries\":" << sums.stale_frontier_entries
       << ",\"light_edge_visits\":" << sums.light_edge_visits
       << ",\"heavy_edge_visits\":" << sums.heavy_edge_visits
+      << ",\"bounds_rejected_edges\":" << sums.bounds_rejected_edges
       << ",\"distance_atomic_attempts\":"
       << sums.distance_atomic_attempts
       << ",\"successful_distance_relaxations\":"
@@ -1659,101 +1774,6 @@ float parse_float_arg(const char* text, const char* name) {
   return value;
 }
 
-std::uint64_t parse_u64_arg(const char* text, const char* name) {
-  if (text[0] == '-') {
-    throw std::runtime_error(std::string("invalid ") + name + ": " + text);
-  }
-  char* end = nullptr;
-  errno = 0;
-  const unsigned long long value = std::strtoull(text, &end, 10);
-  if (end == text || *end != '\0' || errno == ERANGE) {
-    throw std::runtime_error(std::string("invalid ") + name + ": " + text);
-  }
-  return static_cast<std::uint64_t>(value);
-}
-
-enum class DeltaBenchmarkWeights {
-  kOriginal,
-  kUnit,
-  kAllLight,
-  kAllHeavy,
-  kMixed,
-};
-
-DeltaBenchmarkWeights parse_delta_benchmark_weights_arg(const char* text) {
-  const std::string value(text);
-  if (value == "unit") return DeltaBenchmarkWeights::kUnit;
-  if (value == "all-light") return DeltaBenchmarkWeights::kAllLight;
-  if (value == "all-heavy") return DeltaBenchmarkWeights::kAllHeavy;
-  if (value == "mixed") return DeltaBenchmarkWeights::kMixed;
-  throw std::runtime_error(
-      "invalid delta-benchmark-weights: " + value +
-      " (expected unit, all-light, all-heavy, or mixed)");
-}
-
-const char* delta_benchmark_weights_name(DeltaBenchmarkWeights mode) {
-  switch (mode) {
-    case DeltaBenchmarkWeights::kOriginal:
-      return "original";
-    case DeltaBenchmarkWeights::kUnit:
-      return "unit";
-    case DeltaBenchmarkWeights::kAllLight:
-      return "all-light";
-    case DeltaBenchmarkWeights::kAllHeavy:
-      return "all-heavy";
-    case DeltaBenchmarkWeights::kMixed:
-      return "mixed";
-  }
-  return "unknown";
-}
-
-std::uint64_t splitmix64(std::uint64_t value) {
-  value += UINT64_C(0x9e3779b97f4a7c15);
-  value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-  value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
-  return value ^ (value >> 31);
-}
-
-void apply_delta_benchmark_weights(HostCsrF32& graph,
-                                   DeltaBenchmarkWeights mode,
-                                   float delta,
-                                   std::uint64_t seed) {
-  if (mode == DeltaBenchmarkWeights::kOriginal) return;
-  if (!(delta > 0.0f) || !std::isfinite(delta)) {
-    throw std::invalid_argument(
-        "delta benchmark weights require a finite positive numeric delta");
-  }
-  const float light = delta * 0.25f;
-  const float heavy = delta * 4.0f;
-  if (!std::isfinite(light) || !std::isfinite(heavy)) {
-    throw std::invalid_argument(
-        "numeric delta is too large for the benchmark weight family");
-  }
-  for (std::size_t edge = 0; edge < graph.values.size(); ++edge) {
-    switch (mode) {
-      case DeltaBenchmarkWeights::kOriginal:
-        break;
-      case DeltaBenchmarkWeights::kUnit:
-        graph.values[edge] = 1.0f;
-        break;
-      case DeltaBenchmarkWeights::kAllLight:
-        graph.values[edge] = light;
-        break;
-      case DeltaBenchmarkWeights::kAllHeavy:
-        graph.values[edge] = heavy;
-        break;
-      case DeltaBenchmarkWeights::kMixed: {
-        constexpr float kFactors[] = {0.0f, 0.25f, 1.0f, 4.0f};
-        const std::uint64_t hash =
-            splitmix64(static_cast<std::uint64_t>(edge) ^ seed);
-        graph.values[edge] =
-            delta * kFactors[static_cast<std::size_t>(hash & 3U)];
-        break;
-      }
-    }
-  }
-}
-
 void parse_delta_arg(const char* text, PathfinderOptions* options) {
   if (options == nullptr) {
     throw std::invalid_argument("delta option destination must not be null");
@@ -1779,18 +1799,38 @@ DeltaSteppingCsrControllerMode parse_delta_controller_arg(const char* text) {
 
 SsspEngine parse_sssp_engine_arg(const char* text) {
   const std::string value(text);
-  if (value == "delta" || value == "delta-step" ||
-      value == "delta-stepping" || value == "delta_stepping") {
+  if (value == "delta-step") {
     return SsspEngine::kDeltaStep;
   }
-  if (value == "bellman-ford" || value == "bellman_ford" ||
-      value == "bf11" || value == "bellman-ford-11" ||
-      value == "bellman_ford_11") {
+  if (value == "bellman-ford") {
     return SsspEngine::kBellmanFord;
   }
   throw std::runtime_error(
       "invalid sssp-engine: " + value +
-      " (expected delta-step/delta-stepping or bellman-ford/bf11)");
+      " (expected delta-step or bellman-ford)");
+}
+
+const char* bellman_ford_hip_graph_mode_name(
+    BellmanFordHipGraphMode mode) noexcept {
+  switch (mode) {
+    case BellmanFordHipGraphMode::kAuto:
+      return "auto";
+    case BellmanFordHipGraphMode::kOn:
+      return "on";
+    case BellmanFordHipGraphMode::kOff:
+      return "off";
+  }
+  return "unknown";
+}
+
+BellmanFordHipGraphMode parse_bellman_ford_hip_graph_mode_arg(const char* text) {
+  const std::string value(text);
+  if (value == "auto") return BellmanFordHipGraphMode::kAuto;
+  if (value == "on") return BellmanFordHipGraphMode::kOn;
+  if (value == "off") return BellmanFordHipGraphMode::kOff;
+  throw std::runtime_error(
+      "invalid bellman-ford-hip-graph mode: " + value +
+      " (expected auto, on, or off)");
 }
 
 void validate_delta_controller_cli_controls(
@@ -1812,11 +1852,12 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <engine>          delta-step (default), delta-stepping, bellman-ford, or bf11.\n"
+      << "  --sssp-engine <engine>          delta-step (default) or bellman-ford.\n"
       << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          SSSP rounds; -1 for engine default.\n"
-      << "  --delta-force-legacy-parent     Force generic Delta predecessor recovery for A/B comparison.\n"
+      << "  --delta-force-legacy-parent     Force legacy generic predecessor recovery for A/B comparison.\n"
+      << "  --delta-force-generic           Bypass automatic exact-unit traversal for A/B comparison.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                  Generic Delta controller. Default: host-checked\n"
       << "  --delta-controller-batch-size <positive-int>\n"
@@ -1826,30 +1867,21 @@ void print_usage(const char* program) {
       << "  --bounds                       Explicitly enable coordinate bounds (the default).\n"
       << "  --bbox-margin-x <int>           Nonnegative horizontal margin. Default: 2\n"
       << "  --bbox-margin-y <int>           Nonnegative vertical margin. Default: 14\n"
-      << "  --no-unbounded-fallback         Do not retry an unreachable bounded query unbounded.\n"
-      << "  --target-check-interval <int>   BF11 target-certificate interval. Default: 1\n"
-      << "  --bf11-unbounded                Compatibility alias for --unbounded.\n"
-      << "  --bf11-bbox-margin-x <int>      Compatibility alias for --bbox-margin-x.\n"
-      << "  --bf11-bbox-margin-y <int>      Compatibility alias for --bbox-margin-y.\n"
-      << "  --bf11-no-unbounded-fallback    Compatibility alias for --no-unbounded-fallback.\n"
-      << "  --bf11-target-check-interval <int> Compatibility target-check alias.\n"
-      << "  --bf11-telemetry                Emit aggregate BF11 phase/work/memory telemetry.\n"
-      << "  --bellman-ford-telemetry        Alias for --bf11-telemetry.\n"
-      << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
-      << "                                  Replace CSR weights deterministically for numeric-delta benchmarks.\n"
-      << "  --delta-benchmark-weight-seed <uint>\n"
-      << "                                  Seed for the mixed benchmark family. Default: 0\n"
+      << "  --no-unbounded-fallback         Do not retry a bounded attempt lacking a reached-and-certified result.\n"
+      << "                                  A target without coordinates otherwise starts unbounded; here it is an error.\n"
+      << "  --bellman-ford-target-check-interval <int>\n"
+      << "                                  Target-certificate interval. Default: 1\n"
+      << "  --bellman-ford-segment-rounds <1|2|4|8|16>\n"
+      << "                                  Explicit-stream segment size. Default: 1\n"
+      << "  --bellman-ford-hip-graph <auto|on|off> HIP Graph replay policy. Default: auto\n"
+      << "  --bellman-ford-adaptive-reset-threshold <fraction>\n"
+      << "                                  Dense reset threshold in (0, 1]. Default: 0.25\n"
+      << "  --bellman-ford-diagnostics      Emit one aggregate Bellman-Ford diagnostics JSON record.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (automatic).\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
-      << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n"
-      << "\nCompatibility-only options accepted and ignored by this one-shot router:\n"
-      << "  --max-pathfinder-iters <int>\n"
-      << "  --present-factor <float>\n"
-      << "  --present-multiplier <float>\n"
-      << "  --history-factor <float>\n"
-      << "  --route-batch-size <count>\n";
+      << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
 
 RoutingMetadata load_interchange_metadata(
@@ -1863,6 +1895,7 @@ RoutingMetadata load_interchange_metadata(
     default:
       throw std::invalid_argument("unknown interchange metadata load mode");
   }
+
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     throw std::runtime_error("could not open metadata file: " + path.string());
@@ -1871,40 +1904,50 @@ RoutingMetadata load_interchange_metadata(
   char magic[sizeof(METADATA_MAGIC)] = {};
   in.read(magic, sizeof(magic));
   if (!in || std::memcmp(magic, METADATA_MAGIC, sizeof(METADATA_MAGIC)) != 0) {
-    throw std::runtime_error("input is not a recognized RIPS interchange metadata file");
+    throw std::runtime_error(
+        "input is not a recognized RIPS interchange metadata file");
   }
 
   const std::uint64_t version = read_u64(in, "metadata format version");
   const std::uint64_t orientation = read_u64(in, "metadata orientation");
-  if (version < LEGACY_METADATA_VERSION ||
-      version > CURRENT_METADATA_VERSION) {
-    throw std::runtime_error("unsupported metadata format version");
+  if (version != METADATA_VERSION) {
+    throw std::runtime_error(
+        "unsupported metadata format version; regenerate it with "
+        "interchange_to_csr");
   }
   if (orientation != EXPECTED_OUTGOING_EDGE_ORIENTATION) {
     throw std::runtime_error("unsupported metadata orientation");
   }
 
-  std::optional<interchange::InterchangeArtifactPairId> parsed_pair_id;
-  if (version >= FIRST_PAIRED_METADATA_VERSION) {
-    interchange::InterchangeArtifactPairId id;
-    id.high = read_u64(in, "metadata artifact pair id high");
-    id.low = read_u64(in, "metadata artifact pair id low");
-    if (id.is_zero()) {
-      throw std::runtime_error("metadata artifact pair id must not be zero");
-    }
-    parsed_pair_id = id;
+  interchange::InterchangeArtifactPairId pair_id;
+  pair_id.high = read_u64(in, "metadata artifact pair id high");
+  pair_id.low = read_u64(in, "metadata artifact pair id low");
+  if (pair_id.is_zero()) {
+    throw std::runtime_error("metadata artifact pair id must not be zero");
   }
 
-  const std::uint64_t string_count = read_u64(in, "metadata string count");
-  const std::uint64_t node_count = read_u64(in, "metadata node count");
-  const std::uint64_t edge_attr_count = read_u64(in, "metadata edge attribute count");
-  const std::uint64_t pip_data_count = read_u64(in, "metadata pip data count");
-  const std::uint64_t site_pin_attr_count = read_u64(in, "metadata site pin attr count");
-  const std::uint64_t route_request_count = read_u64(in, "metadata route request count");
-  const std::uint64_t blocked_node_count = read_u64(in, "metadata blocked node count");
-  const std::uint64_t sink_stop_node_count = read_u64(in, "metadata sink stop node count");
-  const std::uint64_t logical_cell_count = read_u64(in, "metadata logical cell count");
-  const std::uint64_t logical_net_count = read_u64(in, "metadata logical net count");
+  const std::uint64_t string_count =
+      read_u64(in, "metadata string count");
+  const std::uint64_t node_count =
+      read_u64(in, "metadata node count");
+  const std::uint64_t edge_attr_count =
+      read_u64(in, "metadata edge attribute count");
+  const std::uint64_t pip_data_count =
+      read_u64(in, "metadata pip data count");
+  const std::uint64_t endpoint_pip_count =
+      read_u64(in, "metadata endpoint PIP count");
+  const std::uint64_t site_pin_attr_count =
+      read_u64(in, "metadata site pin attr count");
+  const std::uint64_t route_request_count =
+      read_u64(in, "metadata route request count");
+  const std::uint64_t blocked_node_count =
+      read_u64(in, "metadata blocked node count");
+  const std::uint64_t sink_stop_node_count =
+      read_u64(in, "metadata sink stop node count");
+  const std::uint64_t logical_cell_count =
+      read_u64(in, "metadata logical cell count");
+  const std::uint64_t logical_net_count =
+      read_u64(in, "metadata logical net count");
   const std::uint64_t logical_port_instance_count =
       read_u64(in, "metadata logical port instance count");
   const std::uint64_t physical_netlist_byte_count =
@@ -1912,54 +1955,43 @@ RoutingMetadata load_interchange_metadata(
   const std::uint64_t logical_netlist_byte_count =
       read_u64(in, "metadata logical byte count");
 
+  if (string_count > std::numeric_limits<std::uint32_t>::max() ||
+      pip_data_count > std::numeric_limits<std::uint32_t>::max()) {
+    throw std::runtime_error(
+        "metadata v8 string/PIP counts exceed compact uint32 limits");
+  }
+  if (logical_cell_count != 0 || logical_port_instance_count != 0 ||
+      physical_netlist_byte_count != 0 ||
+      logical_netlist_byte_count != 0) {
+    throw std::runtime_error(
+        "metadata v8 omitted hierarchy/payload counts must be zero");
+  }
+
   RoutingMetadata metadata;
-  metadata.artifact_pair_id = parsed_pair_id;
+  metadata.artifact_pair_id = pair_id;
   metadata.declared_node_count = node_count;
   metadata.declared_edge_attr_count = edge_attr_count;
-  metadata.device_path_string = read_u64(in, "metadata device path string");
-  metadata.physical_path_string = read_u64(in, "metadata physical path string");
-  metadata.logical_path_string = read_u64(in, "metadata logical path string");
-  metadata.logical_design_name_string = read_u64(in, "metadata logical design name");
+  metadata.declared_endpoint_pip_count = endpoint_pip_count;
+  metadata.device_path_string =
+      read_u64(in, "metadata device path string");
+  metadata.physical_path_string =
+      read_u64(in, "metadata physical path string");
+  metadata.logical_path_string =
+      read_u64(in, "metadata logical path string");
+  metadata.logical_design_name_string =
+      read_u64(in, "metadata logical design name");
 
   metadata.strings.reserve(
       checked_vector_count<std::string>(string_count, "metadata strings"));
   for (std::uint64_t i = 0; i < string_count; ++i) {
     metadata.strings.push_back(read_string(in));
   }
-
-  const bool has_node_arrays = version < CURRENT_METADATA_VERSION;
-  const bool load_node_arrays =
-      mode == InterchangeMetadataLoadMode::kFull && has_node_arrays;
-  if (has_node_arrays) {
-    if (load_node_arrays) {
-      read_array(in, metadata.node_device_ids, node_count,
-                 "metadata device node ids");
-      read_array(in, metadata.node_min_x, node_count,
-                 "metadata node min x coordinates");
-      read_array(in, metadata.node_max_x, node_count,
-                 "metadata node max x coordinates");
-      read_array(in, metadata.node_min_y, node_count,
-                 "metadata node min y coordinates");
-      read_array(in, metadata.node_max_y, node_count,
-                 "metadata node max y coordinates");
-      read_array(in, metadata.node_tile_type_strings, node_count,
-                 "metadata node tile type strings");
-      read_array(in, metadata.node_wire_type_strings, node_count,
-                 "metadata node wire type strings");
-    } else {
-      skip_array<std::uint64_t>(in, node_count, "metadata device node ids");
-      skip_array<std::int32_t>(in, node_count,
-                               "metadata node min x coordinates");
-      skip_array<std::int32_t>(in, node_count,
-                               "metadata node max x coordinates");
-      skip_array<std::int32_t>(in, node_count,
-                               "metadata node min y coordinates");
-      skip_array<std::int32_t>(in, node_count,
-                               "metadata node max y coordinates");
-      skip_array<std::uint64_t>(in, node_count,
-                                "metadata node tile type strings");
-      skip_array<std::uint64_t>(in, node_count,
-                                "metadata node wire type strings");
+  for (const std::uint64_t index :
+       {metadata.device_path_string, metadata.physical_path_string,
+        metadata.logical_path_string, metadata.logical_design_name_string}) {
+    if (index != kNoIndex && index >= string_count) {
+      throw std::runtime_error(
+          "metadata header references an invalid string");
     }
   }
 
@@ -1967,36 +1999,128 @@ RoutingMetadata load_interchange_metadata(
       mode != InterchangeMetadataLoadMode::kRoutingOnly;
   if (load_route_output_tables) {
     read_array(in, metadata.edge_attrs, edge_attr_count,
-               "metadata edge attributes");
+               "metadata compact edge attributes");
+    for (const EdgeAttr& attr : metadata.edge_attrs) {
+      if (attr.tile_string >= string_count ||
+          attr.pip_data_index >= pip_data_count) {
+        throw std::runtime_error(
+            "metadata edge attribute references an invalid string/PIP");
+      }
+    }
   } else {
-    skip_array<EdgeAttr>(in, edge_attr_count, "metadata edge attributes");
+    skip_array<EdgeAttr>(in, edge_attr_count,
+                         "metadata compact edge attributes");
   }
 
   if (load_route_output_tables) {
-    std::vector<PipDataDisk> disk_pip_data;
-    read_array(in, disk_pip_data, pip_data_count, "metadata pip data");
-    metadata.pip_data.resize(disk_pip_data.size());
-    for (std::size_t i = 0; i < disk_pip_data.size(); ++i) {
-      metadata.pip_data[i] = {
-          disk_pip_data[i].wire0_string,
-          disk_pip_data[i].wire1_string,
-          disk_pip_data[i].forward != 0};
+    std::vector<CompactPipDataDisk> disk_pip_data;
+    read_array(in, disk_pip_data, pip_data_count,
+               "metadata compact PIP data");
+    metadata.pip_data.reserve(disk_pip_data.size());
+    for (const CompactPipDataDisk& disk : disk_pip_data) {
+      if (disk.forward > 1 || disk.wire0_string >= string_count ||
+          disk.wire1_string >= string_count) {
+        throw std::runtime_error(
+            "metadata PIP has an invalid string/direction");
+      }
+      metadata.pip_data.push_back(
+          {disk.wire0_string, disk.wire1_string, disk.forward != 0});
     }
   } else {
-    skip_array<PipDataDisk>(in, pip_data_count, "metadata pip data");
+    skip_array<CompactPipDataDisk>(in, pip_data_count,
+                                   "metadata compact PIP data");
+  }
+
+  if (load_route_output_tables) {
+    std::vector<EndpointPipDisk> disk_endpoint_pips;
+    read_array(in, disk_endpoint_pips, endpoint_pip_count,
+               "metadata endpoint PIPs");
+    metadata.endpoint_pips.reserve(disk_endpoint_pips.size());
+    std::unordered_set<minplus_sparse::Offset> endpoint_pip_edges;
+    endpoint_pip_edges.reserve(disk_endpoint_pips.size());
+    for (const EndpointPipDisk& disk : disk_endpoint_pips) {
+      if (disk.csr_edge >= edge_attr_count || disk.forward > 1 ||
+          disk.tile_string >= string_count ||
+          disk.wire0_string >= string_count ||
+          disk.wire1_string >= string_count ||
+          disk.site_string >= string_count) {
+        throw std::runtime_error(
+            "metadata endpoint PIP contains an invalid reference");
+      }
+      const int from =
+          route_node_from_disk(disk.from, "metadata endpoint PIP source node");
+      const int to =
+          route_node_from_disk(disk.to, "metadata endpoint PIP destination node");
+      const int endpoint_node = route_node_from_disk(
+          disk.endpoint_node, "metadata endpoint PIP endpoint node");
+      if (from < 0 || to < 0 || endpoint_node < 0 ||
+          static_cast<std::uint64_t>(from) >= node_count ||
+          static_cast<std::uint64_t>(to) >= node_count ||
+          static_cast<std::uint64_t>(endpoint_node) >= node_count) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references an invalid node");
+      }
+
+      EndpointPipRole role;
+      if (disk.role ==
+          static_cast<std::uint64_t>(EndpointPipRole::kSource)) {
+        role = EndpointPipRole::kSource;
+      } else if (disk.role ==
+                 static_cast<std::uint64_t>(EndpointPipRole::kSink)) {
+        role = EndpointPipRole::kSink;
+      } else {
+        throw std::runtime_error("metadata endpoint PIP has an invalid role");
+      }
+
+      const minplus_sparse::Offset csr_edge =
+          route_edge_from_disk(disk.csr_edge,
+                               "metadata endpoint PIP CSR edge");
+      if (!endpoint_pip_edges.insert(csr_edge).second) {
+        throw std::runtime_error(
+            "metadata contains duplicate endpoint PIPs for one CSR edge");
+      }
+      const EdgeAttr& attr =
+          metadata.edge_attrs[static_cast<std::size_t>(csr_edge)];
+      if (attr.pip_data_index >= metadata.pip_data.size()) {
+        throw std::runtime_error(
+            "metadata endpoint PIP references invalid PIP data");
+      }
+      const PipData& pip =
+          metadata.pip_data[static_cast<std::size_t>(attr.pip_data_index)];
+      if (attr.tile_string != disk.tile_string ||
+          pip.wire0_string != disk.wire0_string ||
+          pip.wire1_string != disk.wire1_string ||
+          pip.forward != (disk.forward != 0)) {
+        throw std::runtime_error(
+            "metadata endpoint PIP does not match its edge/PIP tables");
+      }
+
+      metadata.endpoint_pips.push_back(
+          {csr_edge, from, to, disk.tile_string, disk.wire0_string,
+           disk.wire1_string, disk.forward != 0, disk.site_string,
+           endpoint_node, role});
+    }
+  } else {
+    skip_array<EndpointPipDisk>(in, endpoint_pip_count,
+                                "metadata endpoint PIPs");
   }
 
   if (mode == InterchangeMetadataLoadMode::kFull) {
     std::vector<SitePinNodeDisk> disk_site_pin_attrs;
     read_array(in, disk_site_pin_attrs, site_pin_attr_count,
                "metadata site pin attributes");
-    metadata.site_pin_attrs.resize(disk_site_pin_attrs.size());
-    for (std::size_t i = 0; i < disk_site_pin_attrs.size(); ++i) {
-      metadata.site_pin_attrs[i] = {
-          route_node_from_disk(disk_site_pin_attrs[i].node,
-                               "metadata site pin node"),
-          disk_site_pin_attrs[i].site_string,
-          disk_site_pin_attrs[i].pin_string};
+    metadata.site_pin_attrs.reserve(disk_site_pin_attrs.size());
+    for (const SitePinNodeDisk& disk : disk_site_pin_attrs) {
+      const int node =
+          route_node_from_disk(disk.node, "metadata site pin node");
+      if (node < 0 || static_cast<std::uint64_t>(node) >= node_count ||
+          disk.site_string >= string_count ||
+          disk.pin_string >= string_count) {
+        throw std::runtime_error(
+            "metadata site pin contains an invalid reference");
+      }
+      metadata.site_pin_attrs.push_back(
+          {node, disk.site_string, disk.pin_string, kNoIndex});
     }
   } else {
     skip_array<SitePinNodeDisk>(in, site_pin_attr_count,
@@ -2005,40 +2129,104 @@ RoutingMetadata load_interchange_metadata(
 
   metadata.route_requests.resize(
       checked_vector_count<RouteRequest>(route_request_count,
-                                          "metadata route requests"));
+                                         "metadata route requests"));
   for (RouteRequest& request : metadata.route_requests) {
     request.net_string = read_u64(in, "metadata route request net");
     request.logical_net_index = read_u64(in, "metadata route logical net");
 
-    const std::uint64_t source_count = read_u64(in, "metadata source count");
+    const std::uint64_t source_count =
+        read_u64(in, "metadata source count");
     const std::size_t host_source_count =
         checked_vector_count<SitePinNode>(source_count, "metadata sources");
     sssp_capacity::checked_device_count(host_source_count);
     request.sources.resize(host_source_count);
-    for (SitePinNode& source : request.sources) {
-      source.node = read_route_node(in, "metadata source node");
-      source.site_string = read_u64(in, "metadata source site");
-      source.pin_string = read_u64(in, "metadata source pin");
+    for (SitePinNode& source_node : request.sources) {
+      source_node.node = read_route_node(in, "metadata source node");
+      source_node.site_string = read_u64(in, "metadata source site");
+      source_node.pin_string = read_u64(in, "metadata source pin");
+      source_node.endpoint_pip_index =
+          read_u64(in, "metadata source endpoint PIP index");
+      if (source_node.node < 0 ||
+          static_cast<std::uint64_t>(source_node.node) >= node_count ||
+          source_node.site_string >= string_count ||
+          source_node.pin_string >= string_count ||
+          (source_node.endpoint_pip_index != kNoIndex &&
+           source_node.endpoint_pip_index >= endpoint_pip_count)) {
+        throw std::runtime_error(
+            "metadata source contains an invalid reference");
+      }
+      if (source_node.endpoint_pip_index != kNoIndex &&
+          load_route_output_tables) {
+        const EndpointPip& endpoint_pip = metadata.endpoint_pips[
+            static_cast<std::size_t>(source_node.endpoint_pip_index)];
+        if (endpoint_pip.role != EndpointPipRole::kSource ||
+            endpoint_pip.endpoint_node != source_node.node) {
+          throw std::runtime_error(
+              "metadata source references an endpoint PIP owned by a "
+              "different endpoint or role");
+        }
+      }
     }
 
-    const std::uint64_t sink_count = read_u64(in, "metadata sink count");
+    const std::uint64_t sink_count =
+        read_u64(in, "metadata sink count");
     const std::size_t host_sink_count =
         checked_vector_count<SitePinNode>(sink_count, "metadata sinks");
     sssp_capacity::checked_device_count(host_sink_count);
     request.sinks.resize(host_sink_count);
-    for (SitePinNode& sink : request.sinks) {
-      sink.node = read_route_node(in, "metadata sink node");
-      sink.site_string = read_u64(in, "metadata sink site");
-      sink.pin_string = read_u64(in, "metadata sink pin");
+    for (SitePinNode& sink_node : request.sinks) {
+      sink_node.node = read_route_node(in, "metadata sink node");
+      sink_node.site_string = read_u64(in, "metadata sink site");
+      sink_node.pin_string = read_u64(in, "metadata sink pin");
+      sink_node.endpoint_pip_index =
+          read_u64(in, "metadata sink endpoint PIP index");
+      if (sink_node.node < 0 ||
+          static_cast<std::uint64_t>(sink_node.node) >= node_count ||
+          sink_node.site_string >= string_count ||
+          sink_node.pin_string >= string_count ||
+          (sink_node.endpoint_pip_index != kNoIndex &&
+           sink_node.endpoint_pip_index >= endpoint_pip_count)) {
+        throw std::runtime_error(
+            "metadata sink contains an invalid reference");
+      }
+      if (sink_node.endpoint_pip_index != kNoIndex &&
+          load_route_output_tables) {
+        const EndpointPip& endpoint_pip = metadata.endpoint_pips[
+            static_cast<std::size_t>(sink_node.endpoint_pip_index)];
+        if (endpoint_pip.role != EndpointPipRole::kSink ||
+            endpoint_pip.endpoint_node != sink_node.node) {
+          throw std::runtime_error(
+              "metadata sink references an endpoint PIP owned by a "
+              "different endpoint or role");
+        }
+      }
     }
   }
 
-  skip_array<std::array<std::uint64_t, 3>>(
-      in, logical_cell_count, "metadata logical cells");
-  skip_array<std::array<std::uint64_t, 4>>(
-      in, logical_net_count, "metadata logical nets");
-  skip_array<std::array<std::uint64_t, 7>>(
-      in, logical_port_instance_count, "metadata logical port instances");
+  read_array(in, metadata.logical_net_name_strings, logical_net_count,
+             "metadata logical net names");
+  for (const std::uint64_t name_string :
+       metadata.logical_net_name_strings) {
+    if (name_string >= string_count) {
+      throw std::runtime_error(
+          "metadata logical net references an invalid string");
+    }
+  }
+  for (const RouteRequest& request : metadata.route_requests) {
+    if (request.net_string >= string_count) {
+      throw std::runtime_error(
+          "metadata route request references an invalid net string");
+    }
+    if (request.logical_net_index != kNoIndex) {
+      if (request.logical_net_index >=
+              metadata.logical_net_name_strings.size() ||
+          metadata.logical_net_name_strings[static_cast<std::size_t>(
+              request.logical_net_index)] != request.net_string) {
+        throw std::runtime_error(
+            "metadata physical/logical net-name correlation mismatch");
+      }
+    }
+  }
 
   if (mode == InterchangeMetadataLoadMode::kFull) {
     read_array(in, metadata.blocked_nodes, blocked_node_count,
@@ -2052,12 +2240,7 @@ RoutingMetadata load_interchange_metadata(
                               "metadata sink stop nodes");
   }
 
-  skip_array<std::uint8_t>(in, physical_netlist_byte_count,
-                           "metadata physical bytes");
-  skip_array<std::uint8_t>(in, logical_netlist_byte_count,
-                           "metadata logical bytes");
-  require_position_within_file(in, "interchange metadata");
-
+  require_position_at_end_of_file(in, "interchange metadata");
   return metadata;
 }
 
@@ -2138,7 +2321,6 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                                 hipStream_t stream,
                                 const interchange::RoutingCsrSidecars*
                                     routing_sidecars) {
-  PATHFINDER_PROFILE_RANGE("pathfinder.run");
   validate_options(options);
   int automatic_delta_wavefront_size = 0;
   float resolved_automatic_delta = options.delta;
@@ -2147,7 +2329,6 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     automatic_delta_wavefront_size = current_device_wavefront_size();
   }
   if (options.sssp_engine == SsspEngine::kDeltaStep && options.delta_auto) {
-    PATHFINDER_PROFILE_RANGE("pathfinder.delta_auto_stats");
     // The resolver performs the same complete CSR validation while it gathers
     // the weight statistics. Avoid a second O(V + E) validation pass on large
     // device graphs.
@@ -2162,45 +2343,44 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       routing_sidecars != nullptr &&
       (!routing_sidecars->route_end_x.empty() ||
        !routing_sidecars->route_end_y.empty() ||
-       !routing_sidecars->base_vertex_cost.empty() ||
+       !routing_sidecars->base_vertex_cost.empty());
+  if (routing_sidecars != nullptr &&
+      (routing_sidecars->spatial_edges.min_x != 0 ||
+       routing_sidecars->spatial_edges.min_y != 0 ||
        !routing_sidecars->spatial_edges.offsets.empty() ||
-       !routing_sidecars->spatial_edges.edge_ids.empty());
+       !routing_sidecars->spatial_edges.edge_ids.empty() ||
+       routing_sidecars->spatial_edges.width != 0 ||
+       routing_sidecars->spatial_edges.height != 0)) {
+    throw std::runtime_error(
+        "CSR v4 routing sidecars must not contain spatial shards");
+  }
   if (has_any_routing_sidecars) {
     interchange::validate_routing_csr_sidecars(
         *routing_sidecars, static_cast<std::size_t>(base_graph.rows),
-        static_cast<std::size_t>(base_graph.nnz),
-        !routing_sidecars->spatial_edges.offsets.empty());
+        static_cast<std::size_t>(base_graph.nnz), false);
+  }
+  std::uint64_t delta_unknown_coordinate_nodes = 0;
+  if (options.sssp_engine == SsspEngine::kDeltaStep &&
+      options.delta_telemetry && routing_sidecars != nullptr) {
+    for (std::size_t node = 0;
+         node < routing_sidecars->route_end_x.size(); ++node) {
+      if (routing_sidecars->route_end_x[node] == kMissingRouteCoordinate &&
+          routing_sidecars->route_end_y[node] == kMissingRouteCoordinate) {
+        ++delta_unknown_coordinate_nodes;
+      }
+    }
   }
   if (options.bounds.enabled && !has_any_routing_sidecars) {
     throw std::runtime_error(
-        "bounded routing requires a CSR v3 artifact with route-end "
-        "coordinates; regenerate the CSR or select "
-        "--unbounded/--bf11-unbounded");
+        "bounded routing requires the CSR v4 route-end coordinates; "
+        "regenerate the CSR with interchange_to_csr or select "
+        "--unbounded");
   }
   const std::size_t metadata_node_count =
-      metadata.declared_node_count != 0
-          ? checked_vector_count<std::uint8_t>(metadata.declared_node_count,
-                                               "metadata node count")
-          : metadata.node_device_ids.size();
+      checked_vector_count<std::uint8_t>(metadata.declared_node_count,
+                                         "metadata node count");
   if (metadata_node_count != static_cast<std::size_t>(base_graph.rows)) {
     throw std::runtime_error("metadata node count does not match CSR row count");
-  }
-  const bool has_any_node_metadata =
-      !metadata.node_device_ids.empty() || !metadata.node_min_x.empty() ||
-      !metadata.node_max_x.empty() || !metadata.node_min_y.empty() ||
-      !metadata.node_max_y.empty() ||
-      !metadata.node_tile_type_strings.empty() ||
-      !metadata.node_wire_type_strings.empty();
-  if (has_any_node_metadata &&
-      (metadata.node_device_ids.size() != metadata_node_count ||
-       metadata.node_min_x.size() != metadata_node_count ||
-       metadata.node_max_x.size() != metadata_node_count ||
-       metadata.node_min_y.size() != metadata_node_count ||
-       metadata.node_max_y.size() != metadata_node_count ||
-       metadata.node_tile_type_strings.size() != metadata_node_count ||
-       metadata.node_wire_type_strings.size() != metadata_node_count)) {
-    throw std::runtime_error(
-        "metadata node coordinate range/tile/wire type arrays do not match node count");
   }
   const std::size_t metadata_edge_attr_count =
       metadata.declared_edge_attr_count != 0
@@ -2237,11 +2417,36 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               << ", multiplier=" << delta_options.delta_multiplier << ")\n";
       std::cout << message.str();
     }
+    const bool may_use_exact_unit =
+        !delta_options.delta_force_generic &&
+        !delta_options.delta_force_legacy_parent &&
+        delta_options.max_sssp_iterations < 0 && base_graph.rows > 0 &&
+        static_cast<std::uint64_t>(base_graph.rows) <=
+            kDeltaSteppingCsrMaxExactUnitRows;
+    const bool all_edges_exact_unit =
+        may_use_exact_unit &&
+        std::all_of(base_graph.values.begin(), base_graph.values.end(),
+                    [](float value) { return value == 1.0f; });
+    const bool exact_unit_eligible = delta_stepping_exact_unit_eligible(
+        !delta_options.delta_force_generic,
+        !delta_options.delta_force_legacy_parent,
+        all_edges_exact_unit,
+        false,
+        static_cast<std::int64_t>(base_graph.rows),
+        delta_options.max_sssp_iterations < 0,
+        true);
+    std::cout << "[pathfinder] Delta workspace policy="
+              << (exact_unit_eligible ? "exact-unit-eligible" : "generic")
+              << " (force_generic="
+              << (delta_options.delta_force_generic ? "true" : "false")
+              << ", force_legacy_parent="
+              << (delta_options.delta_force_legacy_parent ? "true" : "false")
+              << ")\n";
     std::cout << "[pathfinder] validating and uploading Delta graph..."
               << std::flush;
     const auto graph_upload_started = std::chrono::steady_clock::now();
     std::shared_ptr<DeltaSteppingCsrGraph> shared_graph;
-    if (has_any_routing_sidecars) {
+    if (delta_options.bounds.enabled) {
       shared_graph = std::make_shared<DeltaSteppingCsrGraph>(
           base_graph, routing_sidecars->route_end_x,
           routing_sidecars->route_end_y, stream);
@@ -2257,10 +2462,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               << std::flush;
     if (delta_options.parallel_net_workers == 0) {
       delta_options.parallel_net_workers = recommend_delta_worker_count(
-          base_graph.rows, route_request_count, stream);
+          base_graph.rows, route_request_count, stream,
+          exact_unit_eligible);
       std::cout << "[pathfinder] auto-selected "
                 << delta_options.parallel_net_workers
-                << " delta-step worker(s)\n";
+                << " delta-step worker(s) (workspace="
+                << (exact_unit_eligible ? "exact-unit" : "generic")
+                << ", force_generic="
+                << (delta_options.delta_force_generic ? "true" : "false")
+                << ", force_legacy_parent="
+                << (delta_options.delta_force_legacy_parent ? "true" : "false")
+                << ")\n";
     }
     DeltaSteppingCsrWorkspaceOptions workspace_options;
     workspace_options.parent_mode =
@@ -2268,17 +2480,13 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             ? DeltaSteppingCsrParentMode::kForceLegacy
             : DeltaSteppingCsrParentMode::kAutomatic;
     workspace_options.execution_mode =
-        DeltaSteppingCsrExecutionMode::kForceGeneric;
+        delta_options.delta_force_generic
+            ? DeltaSteppingCsrExecutionMode::kForceGeneric
+            : DeltaSteppingCsrExecutionMode::kAutomatic;
     workspace_options.controller_mode = delta_options.delta_controller_mode;
     workspace_options.controller_batch_size =
         delta_options.delta_controller_batch_size;
     workspace_options.capacity_hints = query_capacity_hints;
-    std::cout << "[pathfinder] generic bucketed Delta-Stepping is enforced\n";
-    if (workspace_options.parent_mode ==
-        DeltaSteppingCsrParentMode::kForceLegacy) {
-      std::cout << "[pathfinder] selected forced legacy parent mode for "
-                   "generic vector-target delta runs\n";
-    }
     std::vector<std::vector<DeltaSteppingCsrTelemetry>>
         delta_telemetry_records;
     if (delta_options.delta_telemetry) {
@@ -2287,7 +2495,7 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     route_all_nets_with_workspace<DeltaSteppingCsrWorkspace>(
         base_graph, metadata, delta_options, routing_sidecars, stream,
         route_request_count, progress_interval, result.nets, shared_graph,
-        workspace_options,
+        workspace_options, query_capacity_hints,
         delta_options.delta_telemetry ? &delta_telemetry_records : nullptr);
     if (delta_options.delta_telemetry) {
       std::vector<DeltaSteppingCsrTelemetry> flattened_telemetry;
@@ -2300,6 +2508,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         flattened_telemetry.insert(flattened_telemetry.end(),
                                    net_records.begin(), net_records.end());
       }
+      for (DeltaSteppingCsrTelemetry& record : flattened_telemetry) {
+        record.bounds_unknown_coordinate_nodes =
+            delta_unknown_coordinate_nodes;
+      }
       const std::size_t actual_worker_count =
           stream != nullptr
               ? 1
@@ -2308,33 +2520,25 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                     std::max<std::size_t>(1, route_request_count));
       std::cout << delta_telemetry_aggregate_json(
                        flattened_telemetry, delta_options, delta_options.delta,
-                       automatic_delta_wavefront_size, actual_worker_count)
+                       automatic_delta_wavefront_size, actual_worker_count,
+                       delta_unknown_coordinate_nodes)
                 << '\n';
     }
   } else {
     const auto bellman_ford_backend_started =
         std::chrono::steady_clock::now();
     PathfinderOptions bellman_ford_options = options;
-    std::cout << "[pathfinder] validating and uploading BF11 graph..."
+    std::cout << "[pathfinder] validating and uploading Bellman-Ford graph..."
               << std::flush;
     const auto graph_upload_started = std::chrono::steady_clock::now();
-    std::shared_ptr<BellmanFord11CsrGraph> shared_graph;
-    if (has_any_routing_sidecars) {
-      shared_graph = std::make_shared<BellmanFord11CsrGraph>(
-          base_graph, *routing_sidecars, stream);
-    } else {
-      BellmanFord11NodeSidecars legacy_sidecars;
-      legacy_sidecars.route_end_x.assign(
-          static_cast<std::size_t>(base_graph.rows),
-          interchange::kMissingRouteCoordinate);
-      legacy_sidecars.route_end_y.assign(
-          static_cast<std::size_t>(base_graph.rows),
-          interchange::kMissingRouteCoordinate);
-      legacy_sidecars.base_vertex_costs.assign(
-          static_cast<std::size_t>(base_graph.rows), 1.0f);
-      shared_graph = std::make_shared<BellmanFord11CsrGraph>(
-          base_graph, legacy_sidecars, stream);
+    if (!has_any_routing_sidecars || routing_sidecars == nullptr) {
+      throw std::runtime_error(
+          "Bellman-Ford requires the complete RoutingCsrSidecars emitted with CSR "
+          "v4");
     }
+    std::shared_ptr<BellmanFordCsrGraph> shared_graph =
+        std::make_shared<BellmanFordCsrGraph>(
+            base_graph, *routing_sidecars, stream);
     std::cout << " done ("
               << std::chrono::duration<double>(
                      std::chrono::steady_clock::now() - graph_upload_started)
@@ -2343,10 +2547,10 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
               << std::flush;
     const std::size_t requested_workers =
         bellman_ford_options.parallel_net_workers;
-    const Bf11WorkerRecommendation recommendation =
-        recommend_bf11_worker_count(
+    const BellmanFordWorkerRecommendation recommendation =
+        recommend_bellman_ford_worker_count(
             base_graph.rows, query_capacity_hints, route_request_count,
-            stream, bellman_ford_options.bellman_ford_telemetry);
+            stream, bellman_ford_options.bellman_ford_diagnostics);
     if (bellman_ford_options.parallel_net_workers == 0) {
       bellman_ford_options.parallel_net_workers =
           recommendation.policy.worker_count;
@@ -2357,83 +2561,83 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             : std::min<std::size_t>(
                   bellman_ford_options.parallel_net_workers,
                   std::max<std::size_t>(1, route_request_count));
-    std::cout << "[pathfinder] BF11 workers requested=";
+    std::cout << "[pathfinder] Bellman-Ford workers requested=";
     if (requested_workers == 0) {
       std::cout << "auto";
     } else {
       std::cout << requested_workers;
     }
-    std::cout << " selected=" << worker_count
-              << " peak_workspace_bytes_estimate="
-              << recommendation.peak_workspace_device_bytes_estimate
-              << " free_device_bytes_before_workers="
-              << recommendation.free_device_bytes;
-    if (!recommendation.device_architecture.empty()) {
-      std::cout << " architecture=" << recommendation.device_architecture
-                << " compute_units=" << recommendation.compute_unit_count;
+    std::cout << " selected=" << worker_count;
+    if (bellman_ford_options.bellman_ford_diagnostics) {
+      std::cout << " peak_workspace_bytes_estimate="
+                << recommendation.peak_workspace_device_bytes_estimate
+                << " free_device_bytes_before_workers="
+                << recommendation.free_device_bytes;
+      if (!recommendation.device_architecture.empty()) {
+        std::cout << " architecture=" << recommendation.device_architecture
+                  << " compute_units=" << recommendation.compute_unit_count;
+      }
     }
     std::cout << '\n';
 
-    reset_bellman_ford11_runtime_stats();
-    configure_bellman_ford11_runtime_stats(
-        bellman_ford_options.bellman_ford_telemetry,
+    reset_bellman_ford_runtime_stats();
+    configure_bellman_ford_runtime_stats(
+        bellman_ford_options.bellman_ford_diagnostics,
         static_cast<std::uint64_t>(requested_workers),
         static_cast<std::uint64_t>(worker_count),
         static_cast<std::uint64_t>(recommendation.free_device_bytes));
-    BellmanFord11WorkspaceOptions workspace_options;
-    // PathFinder derives the shared engine-neutral box and performs the one
-    // allowed retry, so low-level BF11 auto-bounds remain disabled here.
+    BellmanFordWorkspaceOptions workspace_options;
+    // PathFinder derives the shared engine-neutral box and owns any retry, so
+    // automatic derivation and fallback stay disabled in this workspace.
     workspace_options.auto_bounds = false;
     workspace_options.target_check_interval =
-        bellman_ford_options.target_check_interval;
-    workspace_options.telemetry =
-        bellman_ford_options.bellman_ford_telemetry;
+        bellman_ford_options.bellman_ford_target_check_interval;
+    workspace_options.diagnostics =
+        bellman_ford_options.bellman_ford_diagnostics;
+    workspace_options.segment_rounds =
+        bellman_ford_options.bellman_ford_segment_rounds;
+    workspace_options.hip_graph_mode =
+        bellman_ford_options.bellman_ford_hip_graph_mode;
+    workspace_options.adaptive_reset_threshold =
+        bellman_ford_options.bellman_ford_adaptive_reset_threshold;
     if (worker_count > 1) {
       std::cout
-          << "[pathfinder] BF11 parallel workers use independent explicit "
-             "streams with the host-checked controller; the persistent "
+          << "[pathfinder] Bellman-Ford parallel workers use independent explicit "
+             "streams with the segmented controller; the persistent "
              "cooperative controller remains single-worker only\n";
     }
-    route_all_nets_with_workspace<BellmanFord11CsrWorkspace>(
+    route_all_nets_with_workspace<BellmanFordCsrWorkspace>(
         base_graph, metadata, bellman_ford_options, routing_sidecars, stream,
         route_request_count, progress_interval, result.nets, shared_graph,
-        workspace_options, nullptr);
+        workspace_options, query_capacity_hints, nullptr);
 
-    const BellmanFord11RuntimeStats stats =
-        bellman_ford11_runtime_stats();
-    const double bellman_ford_backend_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                      bellman_ford_backend_started)
-            .count();
-    const std::size_t centralized_unbounded_retries =
-        static_cast<std::size_t>(std::count_if(
-            result.nets.begin(), result.nets.end(),
-            [](const RoutedNet& net) { return net.used_unbounded_retry; }));
-    std::cout << "{\"type\":\"bf11_runtime_stats\",\"schema_version\":2"
-              << ",\"workers\":" << worker_count
-              << ",\"requested_workers\":" << requested_workers
-              << ",\"effective_workers\":" << worker_count
-              << ",\"routing_seconds\":"
-              << bellman_ford_backend_seconds
-              << ",\"persistent_controller_runs\":"
-              << stats.persistent_controller_runs
-              << ",\"host_controller_runs\":" << stats.host_controller_runs
-              << ",\"target_checks\":" << stats.target_checks
-              << ",\"auto_unbounded_retries\":"
-              << centralized_unbounded_retries +
-                     static_cast<std::size_t>(stats.auto_unbounded_retries)
-              << ",\"sparse_state_resets\":" << stats.sparse_state_resets
-              << ",\"workspace_state_initializations\":"
-              << stats.workspace_state_initializations
-              << ",\"defensive_dense_state_resets\":"
-              << stats.defensive_dense_state_resets << "}\n";
-    if (bellman_ford_options.bellman_ford_telemetry) {
-      std::cout << "{\"type\":\"bf11_telemetry\",\"schema_version\":1"
+    if (bellman_ford_options.bellman_ford_diagnostics) {
+      const BellmanFordRuntimeStats stats = bellman_ford_runtime_stats();
+      const double bellman_ford_backend_seconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        bellman_ford_backend_started)
+              .count();
+      const std::size_t centralized_unbounded_retries =
+          static_cast<std::size_t>(std::count_if(
+              result.nets.begin(), result.nets.end(),
+              [](const RoutedNet& net) { return net.used_unbounded_retry; }));
+      std::cout << "{\"type\":\"bellman_ford_diagnostics\",\"schema_version\":2"
                 << ",\"requested_workers\":" << stats.requested_workers
                 << ",\"effective_workers\":" << stats.effective_workers
-                << ",\"queries\":" << stats.telemetry_queries
+                << ",\"configuration\":{\"segment_rounds\":"
+                << bellman_ford_options.bellman_ford_segment_rounds
+                << ",\"hip_graph\":\""
+                << bellman_ford_hip_graph_mode_name(
+                       bellman_ford_options.bellman_ford_hip_graph_mode)
+                << "\",\"adaptive_reset_threshold\":"
+                << bellman_ford_options.bellman_ford_adaptive_reset_threshold << "}"
+                << ",\"diagnostics_enabled\":"
+                << (stats.diagnostics_enabled ? "true" : "false")
+                << ",\"routing_seconds\":"
+                << bellman_ford_backend_seconds
+                << ",\"queries\":" << stats.diagnostics_queries
                 << ",\"completed_queries\":"
-                << stats.telemetry_completed_queries
+                << stats.diagnostics_completed_queries
                 << ",\"timing_nanoseconds\":{\"total_query_cpu\":"
                 << stats.total_query_nanoseconds
                 << ",\"reset_seed_gpu\":"
@@ -2448,25 +2652,81 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
                 << stats.stream_synchronize_cpu_nanoseconds
                 << ",\"target_summary_gpu\":"
                 << stats.target_summary_gpu_nanoseconds
+                << ",\"target_prefix_gpu\":"
+                << stats.target_prefix_gpu_nanoseconds
                 << ",\"path_reconstruction_gpu\":"
                 << stats.path_reconstruction_gpu_nanoseconds
-                << "},\"work\":{\"iterations\":" << stats.iterations
+                << ",\"output_transfer_gpu\":"
+                << stats.output_transfer_gpu_nanoseconds
+                << "},\"work\":{\"persistent_controller_runs\":"
+                << stats.persistent_controller_runs
+                << ",\"host_controller_runs\":"
+                << stats.host_controller_runs
+                << ",\"target_checks\":" << stats.target_checks
+                << ",\"iterations\":" << stats.iterations
+                << ",\"rounds\":" << stats.rounds
+                << ",\"segments\":" << stats.segments
+                << ",\"no_op_segment_rounds\":"
+                << stats.no_op_segment_rounds
+                << ",\"direct_segments\":" << stats.direct_segments
+                << ",\"hip_graph_segments\":"
+                << stats.hip_graph_segments
+                << ",\"status_copies\":" << stats.status_copies
+                << ",\"stream_synchronizations\":"
+                << stats.stream_synchronizations
+                << ",\"graph_fallbacks\":" << stats.graph_fallbacks
                 << ",\"frontier_vertices_processed\":"
                 << stats.frontier_vertices_processed
                 << ",\"edges_examined\":" << stats.edges_examined
                 << ",\"successful_relaxations\":"
                 << stats.successful_relaxations
+                << ",\"first_discoveries\":" << stats.first_discoveries
+                << ",\"mark_cas_attempts\":" << stats.mark_cas_attempts
+                << ",\"mark_cas_wins\":" << stats.mark_cas_wins
+                << ",\"queue_reservations\":" << stats.queue_reservations
                 << ",\"touched_vertices\":" << stats.touched_vertices
                 << ",\"maximum_touched_vertices\":"
                 << stats.maximum_touched_vertices
                 << ",\"maximum_touched_fraction\":"
                 << stats.maximum_touched_fraction
-                << "},\"memory\":{\"peak_workspace_device_bytes_estimate\":"
-                << recommendation.peak_workspace_device_bytes_estimate
+                << "},\"resets\":{\"sparse\":"
+                << stats.sparse_state_resets
+                << ",\"adaptive_dense\":"
+                << stats.adaptive_dense_state_resets
+                << ",\"defensive_dense\":"
+                << stats.defensive_dense_state_resets
+                << "},\"cost_modes\":{\"constant_one\":"
+                << stats.constant_one_queries
+                << ",\"static\":" << stats.static_cost_queries
+                << ",\"dynamic\":" << stats.dynamic_cost_queries
+                << "},\"fallback\":{\"bounded\":"
+                << stats.bounded_fallbacks
+                << ",\"bounded_to_unbounded_retries\":"
+                << centralized_unbounded_retries
+                << ",\"avoided_failed_attempt_extractions\":"
+                << stats.avoided_failed_attempt_extractions
+                << "},\"memory\":{\"workspace_cost_mode\":\"identity\""
+                << ",\"preallocated_query_device_bytes_estimate\":"
+                << recommendation.workspace_bytes
+                       .preallocated_query_device_bytes
+                << ",\"retained_workspace_device_bytes_estimate\":"
+                << recommendation.workspace_bytes
+                       .identity_retained_device_bytes
+                << ",\"peak_workspace_device_bytes_estimate\":"
+                << recommendation.workspace_bytes
+                       .identity_automatic_peak_device_bytes
+                << ",\"worst_case_dynamic_retained_device_bytes_estimate\":"
+                << recommendation.workspace_bytes
+                       .worst_case_dynamic_retained_device_bytes
+                << ",\"worst_case_dynamic_peak_device_bytes_estimate\":"
+                << recommendation.workspace_bytes
+                       .worst_case_dynamic_automatic_peak_device_bytes
                 << ",\"workspace_device_bytes_total\":"
                 << stats.workspace_device_bytes_total
                 << ",\"workspace_device_bytes_per_worker_max\":"
                 << stats.workspace_device_bytes_per_worker_max
+                << ",\"workspace_device_bytes_current_total\":"
+                << stats.workspace_device_bytes_current_total
                 << ",\"gpu_free_before_workers\":"
                 << stats.gpu_free_before_workers
                 << ",\"gpu_free_after_workers\":"
@@ -2546,6 +2806,68 @@ std::string string_at(const RoutingMetadata& metadata, std::uint64_t index) {
   return metadata.strings[static_cast<std::size_t>(index)];
 }
 
+using EndpointPipByCsrEdge =
+    std::unordered_map<minplus_sparse::Offset, std::uint64_t>;
+
+EndpointPipByCsrEdge validate_endpoint_pip_table(
+    const HostCsrF32& graph,
+    const RoutingMetadata& metadata) {
+  if (metadata.declared_endpoint_pip_count !=
+      metadata.endpoint_pips.size()) {
+    throw std::runtime_error(
+        "loaded endpoint-PIP table does not match its declared count");
+  }
+
+  EndpointPipByCsrEdge endpoint_pips_by_edge;
+  endpoint_pips_by_edge.reserve(metadata.endpoint_pips.size());
+  for (std::size_t index = 0; index < metadata.endpoint_pips.size(); ++index) {
+    const EndpointPip& endpoint_pip = metadata.endpoint_pips[index];
+    if (endpoint_pip.csr_edge < 0 || endpoint_pip.csr_edge >= graph.nnz ||
+        !valid_node(endpoint_pip.from, graph.rows) ||
+        !valid_node(endpoint_pip.to, graph.rows) ||
+        !valid_node(endpoint_pip.endpoint_node, graph.rows) ||
+        endpoint_pip.csr_edge <
+            graph.rowptr[static_cast<std::size_t>(endpoint_pip.from)] ||
+        endpoint_pip.csr_edge >=
+            graph.rowptr[static_cast<std::size_t>(endpoint_pip.from + 1)] ||
+        graph.colind[static_cast<std::size_t>(endpoint_pip.csr_edge)] !=
+            endpoint_pip.to) {
+      throw std::runtime_error(
+          "metadata contains an invalid endpoint-PIP CSR edge");
+    }
+    if (endpoint_pip.tile_string >= metadata.strings.size() ||
+        endpoint_pip.wire0_string >= metadata.strings.size() ||
+        endpoint_pip.wire1_string >= metadata.strings.size() ||
+        endpoint_pip.site_string >= metadata.strings.size()) {
+      throw std::runtime_error(
+          "metadata endpoint PIP references an invalid string");
+    }
+    const EdgeAttr& attr =
+        metadata.edge_attrs[static_cast<std::size_t>(endpoint_pip.csr_edge)];
+    if (attr.pip_data_index >= metadata.pip_data.size()) {
+      throw std::runtime_error(
+          "metadata endpoint PIP references invalid PIP data");
+    }
+    const PipData& pip =
+        metadata.pip_data[static_cast<std::size_t>(attr.pip_data_index)];
+    if (attr.tile_string != endpoint_pip.tile_string ||
+        pip.wire0_string != endpoint_pip.wire0_string ||
+        pip.wire1_string != endpoint_pip.wire1_string ||
+        pip.forward != endpoint_pip.forward) {
+      throw std::runtime_error(
+          "metadata endpoint PIP does not match its edge/PIP tables");
+    }
+    if (!endpoint_pips_by_edge
+             .emplace(endpoint_pip.csr_edge,
+                      static_cast<std::uint64_t>(index))
+             .second) {
+      throw std::runtime_error(
+          "metadata contains duplicate endpoint PIPs for one CSR edge");
+    }
+  }
+  return endpoint_pips_by_edge;
+}
+
 void write_routes_jsonl_impl(const std::filesystem::path& path,
                              const HostCsrF32& graph,
                              const RoutingMetadata& metadata,
@@ -2562,6 +2884,8 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
   if (result.nets.size() > metadata.route_requests.size()) {
     throw std::runtime_error("pathfinder result has more nets than metadata requests");
   }
+  const EndpointPipByCsrEdge endpoint_pips_by_edge =
+      validate_endpoint_pip_table(graph, metadata);
   if (path.has_parent_path()) {
     std::filesystem::create_directories(path.parent_path());
   }
@@ -2589,6 +2913,14 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
     out << ",\"sssp_certified\":"
         << (net.sssp_certified ? "true" : "false");
     out << ",\"bounded\":" << (net.bounded_query ? "true" : "false");
+    out << ",\"query_bounds\":{\"enabled\":"
+        << (net.query_bounds.enabled ? "true" : "false")
+        << ",\"min_x\":" << net.query_bounds.min_x
+        << ",\"max_x\":" << net.query_bounds.max_x
+        << ",\"min_y\":" << net.query_bounds.min_y
+        << ",\"max_y\":" << net.query_bounds.max_y << '}';
+    out << ",\"target_missing_coordinates\":"
+        << (net.target_missing_coordinates ? "true" : "false");
     out << ",\"unbounded_retry\":"
         << (net.used_unbounded_retry ? "true" : "false");
 
@@ -2671,7 +3003,22 @@ void write_routes_jsonl_impl(const std::filesystem::path& path,
         write_json_string(out, string_at(metadata, pip.wire0_string));
         out << ",\"wire1\":";
         write_json_string(out, string_at(metadata, pip.wire1_string));
-        out << ",\"forward\":" << (pip.forward ? "true" : "false") << '}';
+        out << ",\"forward\":" << (pip.forward ? "true" : "false");
+        const auto attachment =
+            endpoint_pips_by_edge.find(path_edge.csr_edge);
+        out << ",\"attachment\":";
+        if (attachment == endpoint_pips_by_edge.end()) {
+          out << "null,\"site\":null";
+        } else {
+          out << attachment->second << ",\"site\":";
+          write_json_string(
+              out,
+              string_at(metadata,
+                        metadata.endpoint_pips[static_cast<std::size_t>(
+                            attachment->second)]
+                            .site_string));
+        }
+        out << '}';
       }
     }
     out << "]}\n";
@@ -2698,7 +3045,6 @@ void write_routes_jsonl_loaded_artifact(const std::filesystem::path& path,
 
 }  // namespace routing
 
-#ifndef ROUTING_PATHFINDER_NO_MAIN
 int main(int argc, char** argv) {
   try {
     if (argc < 2 ||
@@ -2713,16 +3059,10 @@ int main(int argc, char** argv) {
     std::filesystem::path routes_out_path;
     routing::PathfinderOptions options;
     bool allow_unrouted_routes = false;
-    bool delta_option_seen = false;
     bool delta_specific_option_seen = false;
     bool delta_controller_seen = false;
     bool delta_controller_batch_size_seen = false;
     bool bellman_ford_specific_option_seen = false;
-    bool delta_benchmark_weights_seen = false;
-    bool delta_benchmark_weight_seed_seen = false;
-    routing::DeltaBenchmarkWeights delta_benchmark_weights =
-        routing::DeltaBenchmarkWeights::kOriginal;
-    std::uint64_t delta_benchmark_weight_seed = 0;
 
     int arg = 2;
     if (arg < argc && std::string(argv[arg]).rfind("--", 0) != 0) {
@@ -2747,28 +3087,16 @@ int main(int argc, char** argv) {
       if (option == "--sssp-engine") {
         options.sssp_engine = routing::parse_sssp_engine_arg(
             require_value("--sssp-engine"));
-      } else if (option == "--use-delta-step") {
-        options.sssp_engine = routing::SsspEngine::kDeltaStep;
       } else if (option == "--delta") {
         routing::parse_delta_arg(require_value("--delta"), &options);
-        delta_option_seen = true;
         delta_specific_option_seen = true;
       } else if (option == "--delta-multiplier") {
         options.delta_multiplier = routing::parse_float_arg(
             require_value("--delta-multiplier"), "delta-multiplier");
         delta_specific_option_seen = true;
-      } else if (option == "--max-pathfinder-iters") {
-        (void)routing::parse_int_arg(require_value("--max-pathfinder-iters"),
-                                     "max-pathfinder-iters");
       } else if (option == "--max-sssp-iters") {
         options.max_sssp_iterations =
             routing::parse_int_arg(require_value("--max-sssp-iters"), "max-sssp-iters");
-      } else if (option == "--delta-force-legacy-parent") {
-        options.delta_force_legacy_parent = true;
-        delta_specific_option_seen = true;
-      } else if (option == "--delta-force-generic") {
-        // This focused repository profiles the generic Delta scheduler only.
-        delta_specific_option_seen = true;
       } else if (option == "--delta-controller") {
         options.delta_controller_mode =
             routing::parse_delta_controller_arg(
@@ -2784,66 +3112,52 @@ int main(int argc, char** argv) {
       } else if (option == "--delta-telemetry") {
         options.delta_telemetry = true;
         delta_specific_option_seen = true;
-      } else if (option == "--delta-benchmark-weights") {
-        delta_benchmark_weights =
-            routing::parse_delta_benchmark_weights_arg(
-                require_value("--delta-benchmark-weights"));
-        delta_benchmark_weights_seen = true;
+      } else if (option == "--delta-force-legacy-parent") {
+        options.delta_force_legacy_parent = true;
         delta_specific_option_seen = true;
-      } else if (option == "--delta-benchmark-weight-seed") {
-        delta_benchmark_weight_seed = routing::parse_u64_arg(
-            require_value("--delta-benchmark-weight-seed"),
-            "delta-benchmark-weight-seed");
-        delta_benchmark_weight_seed_seen = true;
+      } else if (option == "--delta-force-generic") {
+        options.delta_force_generic = true;
         delta_specific_option_seen = true;
-      } else if (option == "--unbounded" ||
-                 option == "--bf11-unbounded") {
+      } else if (option == "--unbounded") {
         options.bounds.enabled = false;
-      } else if (option == "--bounds" || option == "--bounded" ||
-                 option == "--bf11-bounds") {
+      } else if (option == "--bounds") {
         options.bounds.enabled = true;
-      } else if (option == "--bbox-margin-x" ||
-                 option == "--bf11-bbox-margin-x") {
+      } else if (option == "--bbox-margin-x") {
         options.bounds.margin_x = routing::parse_int_arg(
-            require_value(option.c_str()),
-            option == "--bbox-margin-x" ? "bbox-margin-x"
-                                         : "bf11-bbox-margin-x");
-      } else if (option == "--bbox-margin-y" ||
-                 option == "--bf11-bbox-margin-y") {
+            require_value("--bbox-margin-x"), "bbox-margin-x");
+      } else if (option == "--bbox-margin-y") {
         options.bounds.margin_y = routing::parse_int_arg(
-            require_value(option.c_str()),
-            option == "--bbox-margin-y" ? "bbox-margin-y"
-                                         : "bf11-bbox-margin-y");
-      } else if (option == "--no-unbounded-fallback" ||
-                 option == "--bf11-no-unbounded-fallback") {
+            require_value("--bbox-margin-y"), "bbox-margin-y");
+      } else if (option == "--no-unbounded-fallback") {
         options.bounds.unbounded_fallback = false;
-      } else if (option == "--target-check-interval" ||
-                 option == "--bf11-target-check-interval") {
+      } else if (option == "--bellman-ford-target-check-interval") {
         bellman_ford_specific_option_seen = true;
-        options.target_check_interval = routing::parse_int_arg(
-            require_value(option.c_str()),
-            option == "--target-check-interval"
-                ? "target-check-interval"
-                : "bf11-target-check-interval");
-      } else if (option == "--bf11-telemetry" ||
-                 option == "--bellman-ford-telemetry") {
+        options.bellman_ford_target_check_interval = routing::parse_int_arg(
+            require_value("--bellman-ford-target-check-interval"),
+            "bellman-ford-target-check-interval");
+      } else if (option == "--bellman-ford-segment-rounds") {
         bellman_ford_specific_option_seen = true;
-        options.bellman_ford_telemetry = true;
+        options.bellman_ford_segment_rounds = routing::parse_int_arg(
+            require_value("--bellman-ford-segment-rounds"),
+            "bellman-ford-segment-rounds");
+      } else if (option == "--bellman-ford-hip-graph") {
+        bellman_ford_specific_option_seen = true;
+        options.bellman_ford_hip_graph_mode =
+            routing::parse_bellman_ford_hip_graph_mode_arg(
+                require_value("--bellman-ford-hip-graph"));
+      } else if (option == "--bellman-ford-adaptive-reset-threshold") {
+        bellman_ford_specific_option_seen = true;
+        options.bellman_ford_adaptive_reset_threshold = routing::parse_float_arg(
+            require_value("--bellman-ford-adaptive-reset-threshold"),
+            "bellman-ford-adaptive-reset-threshold");
+      } else if (option == "--bellman-ford-diagnostics") {
+        bellman_ford_specific_option_seen = true;
+        options.bellman_ford_diagnostics = true;
       } else if (option == "--capacity") {
         options.capacity = routing::parse_int_arg(require_value("--capacity"), "capacity");
-      } else if (option == "--present-factor") {
-        (void)routing::parse_float_arg(require_value("--present-factor"), "present-factor");
-      } else if (option == "--present-multiplier") {
-        (void)routing::parse_float_arg(require_value("--present-multiplier"),
-                                       "present-multiplier");
-      } else if (option == "--history-factor") {
-        (void)routing::parse_float_arg(require_value("--history-factor"), "history-factor");
       } else if (option == "--net-limit") {
         options.net_limit =
             routing::parse_size_arg(require_value("--net-limit"), "net-limit");
-      } else if (option == "--route-batch-size") {
-        (void)routing::parse_size_arg(require_value("--route-batch-size"),
-                                      "route-batch-size");
       } else if (option == "--parallel-net-workers") {
         options.parallel_net_workers =
             routing::parse_size_arg(require_value("--parallel-net-workers"),
@@ -2866,23 +3180,10 @@ int main(int argc, char** argv) {
     if (options.sssp_engine == routing::SsspEngine::kDeltaStep &&
         bellman_ford_specific_option_seen) {
       throw std::runtime_error(
-          "BF11 target-check/telemetry controls cannot be used with "
+          "Bellman-Ford controls cannot be used with "
           "--sssp-engine delta-step");
     }
 
-    if (delta_benchmark_weights_seen) {
-      if (!delta_option_seen || options.delta_auto) {
-        throw std::runtime_error(
-            "--delta-benchmark-weights requires an explicit numeric --delta");
-      }
-    }
-    if (delta_benchmark_weight_seed_seen &&
-        delta_benchmark_weights !=
-            routing::DeltaBenchmarkWeights::kMixed) {
-      throw std::runtime_error(
-          "--delta-benchmark-weight-seed requires "
-          "--delta-benchmark-weights mixed");
-    }
     routing::validate_delta_controller_cli_controls(
         options,
         delta_controller_seen,
@@ -2900,9 +3201,8 @@ int main(int argc, char** argv) {
     std::cout << "[pathfinder] loading CSR..." << std::flush;
     const auto csr_load_started = std::chrono::steady_clock::now();
     HostCsrF32 graph = [&]() {
-      PATHFINDER_PROFILE_RANGE("pathfinder.load_csr");
       return routing::load_csrbin(csr_path, &csr_artifact_pair_id,
-                                  &routing_sidecars, false);
+                                  &routing_sidecars);
     }();
     std::cout << " done ("
               << std::chrono::duration<double>(
@@ -2910,23 +3210,9 @@ int main(int argc, char** argv) {
                      .count()
               << " s)\n"
               << std::flush;
-    if (delta_benchmark_weights_seen) {
-      routing::apply_delta_benchmark_weights(
-          graph,
-          delta_benchmark_weights,
-          options.delta,
-          delta_benchmark_weight_seed);
-      std::cout << "[pathfinder] applied deterministic delta benchmark "
-                << "weights="
-                << routing::delta_benchmark_weights_name(
-                       delta_benchmark_weights)
-                << " seed=" << delta_benchmark_weight_seed << "\n";
-    }
-
     std::cout << "[pathfinder] loading routing metadata..." << std::flush;
     const auto metadata_load_started = std::chrono::steady_clock::now();
     routing::RoutingMetadata metadata = [&]() {
-      PATHFINDER_PROFILE_RANGE("pathfinder.load_metadata");
       return routing::load_interchange_metadata(
           metadata_path,
           routing::InterchangeMetadataLoadMode::kRoutingOnly);
@@ -2943,34 +3229,8 @@ int main(int argc, char** argv) {
         csr_artifact_pair_id, metadata.artifact_pair_id,
         publication_snapshot.generation);
 
-    // V5+ artifacts carry a pair ID and publication generation, so their
-    // graph-sized route-output tables can be loaded safely after routing.
-    // Legacy v4 artifacts have neither identity token. Retain their output
-    // tables before routing rather than risk combining routes from one
-    // sidecar with edge/PIP records from a replacement sidecar later.
     const bool defer_route_output_metadata =
-        !routes_out_path.empty() && metadata.artifact_pair_id.has_value();
-    if (!routes_out_path.empty() && !defer_route_output_metadata) {
-      std::cout << "[pathfinder] loading legacy route-output metadata..."
-                << std::flush;
-      const auto legacy_route_metadata_started =
-          std::chrono::steady_clock::now();
-      metadata = routing::load_interchange_metadata(
-          metadata_path,
-          routing::InterchangeMetadataLoadMode::kRoutingWithRouteOutput);
-      routing::interchange::verify_interchange_publication(
-          csr_path, metadata_path, publication_snapshot);
-      routing::interchange::require_matching_interchange_pair_ids(
-          csr_artifact_pair_id, metadata.artifact_pair_id,
-          publication_snapshot.generation);
-      std::cout << " done ("
-                << std::chrono::duration<double>(
-                       std::chrono::steady_clock::now() -
-                       legacy_route_metadata_started)
-                       .count()
-                << " s)\n"
-                << std::flush;
-    }
+        !routes_out_path.empty();
 
     routing::PathfinderResult result =
         routing::run_pathfinder(graph, metadata, options, nullptr,
@@ -3010,7 +3270,6 @@ int main(int argc, char** argv) {
                   << std::flush;
       }
       {
-        PATHFINDER_PROFILE_RANGE("pathfinder.write_routes");
         routing::write_routes_jsonl_loaded_artifact(
             routes_out_path, graph, metadata, result);
       }
@@ -3025,4 +3284,3 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
-#endif

@@ -20,12 +20,11 @@
 //   adjacency row u, column v = weight of directed edge u -> v.
 // The converter emits this orientation directly so the kernel can traverse
 // frontiers without an O(E) GPU transpose.
-// Generic bucketed Delta-Stepping is the only selectable execution mode. Unit
-// edge weights remain ordinary Delta-Stepping inputs; they do not select a BFS
-// or exact-unit traversal.
+// Unlimited multi-target workspace runs with exact unit weights, automatic
+// execution/parent modes, no vertex costs, and no callback use an equivalent
+// append-only traversal specialized for that case.
 enum class DeltaSteppingCsrExecutionPath {
   kNotRun,
-  // Retained only for telemetry/schema compatibility; no dispatch selects it.
   kExactUnit,
   kCompactGeneric,
   kLegacyGeneric,
@@ -77,6 +76,16 @@ struct DeltaSteppingCsrTelemetry {
       kDeltaSteppingCsrRecommendedControllerBatchSize;
   std::uint32_t effective_controller_batch_size = 1;
   bool controller_fallback = false;
+  // Rejected edges remain part of the ordinary light/heavy visit counts, but
+  // never reach a distance atomic. The unknown-coordinate count is an
+  // immutable graph statistic copied into each invocation record.
+  bool bounds_enabled = false;
+  std::int32_t bounds_min_x = 0;
+  std::int32_t bounds_max_x = 0;
+  std::int32_t bounds_min_y = 0;
+  std::int32_t bounds_max_y = 0;
+  std::uint64_t bounds_rejected_edges = 0;
+  std::uint64_t bounds_unknown_coordinate_nodes = 0;
 };
 
 struct DeltaSteppingCsrRunOptions {
@@ -105,8 +114,10 @@ enum class DeltaSteppingCsrParentMode {
 };
 
 enum class DeltaSteppingCsrExecutionMode {
-  // Retain edge weights, destination costs, delta, and parent representation
-  // while using the generic bucket scheduler.
+  // Select exact-unit traversal whenever every correctness guard is met.
+  kAutomatic,
+  // Deliberately bypass exact-unit traversal without changing weights, delta,
+  // vertex costs, parent representation, or any other run policy.
   kForceGeneric,
 };
 
@@ -135,13 +146,12 @@ struct DeltaSteppingCsrWorkspaceOptions {
   DeltaSteppingCsrParentMode parent_mode =
       DeltaSteppingCsrParentMode::kAutomatic;
   DeltaSteppingCsrExecutionMode execution_mode =
-      DeltaSteppingCsrExecutionMode::kForceGeneric;
+      DeltaSteppingCsrExecutionMode::kAutomatic;
   // The established Boolean/clear-kernel implementation remains the default
   // until the generation path is validated on the target AMD GPU.
   DeltaSteppingCsrCurrentMembershipMode current_membership_mode =
       DeltaSteppingCsrCurrentMembershipMode::kBoolean;
-  // Zero fields preserve lazy growth for low-level callers. Keep this field in
-  // its historical aggregate position for source compatibility.
+  // Zero fields preserve lazy growth for low-level callers.
   SsspQueryCapacityHints capacity_hints{};
   // The existing host-checked controller remains the default.  The reduced
   // round-trip path is capability-gated and falls back to it when cooperative
@@ -223,7 +233,7 @@ class DeltaSteppingCsrGraph {
  private:
   // Workspaces retain this immutable backing allocation directly, so moving
   // or replacing the public graph wrapper cannot invalidate live workspaces.
-  std::shared_ptr<Impl> impl_;
+  std::shared_ptr<const Impl> impl_;
   friend class DeltaSteppingCsrWorkspace;
 };
 
@@ -449,7 +459,7 @@ class DeltaSteppingCsrWorkspace {
   DeltaSteppingCsrParentMode parent_mode_ =
       DeltaSteppingCsrParentMode::kAutomatic;
   DeltaSteppingCsrExecutionMode execution_mode_ =
-      DeltaSteppingCsrExecutionMode::kForceGeneric;
+      DeltaSteppingCsrExecutionMode::kAutomatic;
   DeltaSteppingCsrCurrentMembershipMode current_membership_mode_ =
       DeltaSteppingCsrCurrentMembershipMode::kBoolean;
   DeltaSteppingCsrControllerMode controller_mode_ =

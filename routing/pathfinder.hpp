@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../bellman_ford/bf11.hpp"
+#include "../bellman_ford/bellman_ford.hpp"
 #include "../delta_stepping/delta_stepping.hpp"
 #include "../pre-process/import_policy.hpp"
 #include "../pre-process/routing_csr_sidecars.hpp"
@@ -30,8 +30,8 @@ enum class SsspEngine {
 const char* sssp_engine_name(SsspEngine engine) noexcept;
 
 struct EdgeAttr {
-  std::uint64_t tile_string = 0;
-  std::uint64_t pip_data_index = 0;
+  std::uint32_t tile_string = 0;
+  std::uint32_t pip_data_index = 0;
 };
 
 struct PipData {
@@ -40,10 +40,29 @@ struct PipData {
   bool forward = true;
 };
 
+enum class EndpointPipRole : std::uint64_t {
+  kSource = 0,
+  kSink = 1,
+};
+
+struct EndpointPip {
+  minplus_sparse::Offset csr_edge = -1;
+  int from = -1;
+  int to = -1;
+  std::uint64_t tile_string = kNoIndex;
+  std::uint64_t wire0_string = kNoIndex;
+  std::uint64_t wire1_string = kNoIndex;
+  bool forward = true;
+  std::uint64_t site_string = kNoIndex;
+  int endpoint_node = -1;
+  EndpointPipRole role = EndpointPipRole::kSource;
+};
+
 struct SitePinNode {
   int node = -1;
   std::uint64_t site_string = 0;
   std::uint64_t pin_string = 0;
+  std::uint64_t endpoint_pip_index = kNoIndex;
 };
 
 struct RouteRequest {
@@ -56,37 +75,25 @@ struct RouteRequest {
 struct RoutingMetadata {
   std::optional<interchange::InterchangeArtifactPairId> artifact_pair_id;
   std::vector<std::string> strings;
-  std::vector<std::uint64_t> node_device_ids;
-  std::vector<std::int32_t> node_min_x;
-  std::vector<std::int32_t> node_max_x;
-  std::vector<std::int32_t> node_min_y;
-  std::vector<std::int32_t> node_max_y;
-  std::vector<std::uint64_t> node_tile_type_strings;
-  std::vector<std::uint64_t> node_wire_type_strings;
   std::vector<EdgeAttr> edge_attrs;
   std::vector<PipData> pip_data;
+  std::vector<EndpointPip> endpoint_pips;
   std::vector<SitePinNode> site_pin_attrs;
   std::vector<RouteRequest> route_requests;
+  std::vector<std::uint64_t> logical_net_name_strings;
   std::vector<std::uint64_t> blocked_nodes;
   std::vector<std::uint64_t> sink_stop_nodes;
   std::uint64_t device_path_string = kNoIndex;
   std::uint64_t physical_path_string = kNoIndex;
   std::uint64_t logical_path_string = kNoIndex;
   std::uint64_t logical_design_name_string = kNoIndex;
-  // The routing-only v6 sidecar deliberately omits graph-sized per-node
-  // metadata arrays.  Keep the declared header count separately so callers
-  // can still verify that the sidecar and CSR describe the same graph.  Zero
-  // preserves the historical direct-test convention of deriving the count
-  // from node_device_ids.
   std::uint64_t declared_node_count = 0;
-  // Like declared_node_count, this lets the routing-only loader validate the
-  // CSR/metadata pairing without retaining the graph-sized edge/PIP tables.
   std::uint64_t declared_edge_attr_count = 0;
+  std::uint64_t declared_endpoint_pip_count = 0;
 };
 
 enum class InterchangeMetadataLoadMode {
-  // Materialize every section represented by RoutingMetadata.  V6 still has
-  // no per-node arrays because those sections are absent from the format.
+  // Materialize every section represented by RoutingMetadata.
   kFull,
   // Load only strings and route requests needed by PathFinder. Large unused
   // sections are range-checked and skipped without throwaway allocations.
@@ -128,8 +135,6 @@ struct PathfinderOptions {
   SsspEngine sssp_engine = SsspEngine::kDeltaStep;
   float delta = 1.0f;
   int max_sssp_iterations = -1;
-  // Explicit A/B control for generic vector-target Delta-Stepping runs.
-  bool delta_force_legacy_parent = false;
   int capacity = 1;
   std::size_t net_limit = 0;
   // Zero enables automatic worker selection.
@@ -138,6 +143,12 @@ struct PathfinderOptions {
   bool delta_auto = false;
   float delta_multiplier = 1.0f;
   bool delta_telemetry = false;
+  // Preserve the legacy predecessor-node/edge implementation as a separate
+  // A/B control. It also disqualifies the exact-unit execution path.
+  bool delta_force_legacy_parent = false;
+  // Explicit A/B override for the generic bucket scheduler. Automatic mode
+  // otherwise selects exact-unit traversal when every eligibility guard holds.
+  bool delta_force_generic = false;
   // The host-checked controller remains the default.
   DeltaSteppingCsrControllerMode delta_controller_mode =
       DeltaSteppingCsrControllerMode::kHostChecked;
@@ -145,8 +156,12 @@ struct PathfinderOptions {
       static_cast<int>(kDeltaSteppingCsrRecommendedControllerBatchSize);
   // Shared by both engines. Bounds are enabled for every normal routing run.
   RoutingBoundsConfig bounds{};
-  int target_check_interval = 1;
-  bool bellman_ford_telemetry = false;
+  int bellman_ford_target_check_interval = 1;
+  bool bellman_ford_diagnostics = false;
+  int bellman_ford_segment_rounds = 1;
+  BellmanFordHipGraphMode bellman_ford_hip_graph_mode =
+      BellmanFordHipGraphMode::kAuto;
+  double bellman_ford_adaptive_reset_threshold = 0.25;
 };
 
 struct PathfinderResult {

@@ -82,10 +82,8 @@ inline SpatialEdgeShards build_destination_spatial_edge_shards(
     const std::vector<std::int32_t>& route_end_x,
     const std::vector<std::int32_t>& route_end_y,
     const std::vector<std::int32_t>& csr_destinations) {
-  if (route_end_x.size() != route_end_y.size()) {
-    throw std::invalid_argument(
-        "route-end coordinate arrays do not match for spatial sharding");
-  }
+  routing::validate_coordinate_columns(route_end_x, route_end_y,
+                                       route_end_x.size());
   if (csr_destinations.size() >
       static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())) {
     throw std::overflow_error(
@@ -100,13 +98,7 @@ inline SpatialEdgeShards build_destination_spatial_edge_shards(
   for (std::size_t node = 0; node < node_count; ++node) {
     const std::int32_t x = route_end_x[node];
     const std::int32_t y = route_end_y[node];
-    const bool x_missing = x == kMissingRouteCoordinate;
-    const bool y_missing = y == kMissingRouteCoordinate;
-    if (x_missing != y_missing || (!x_missing && (x < 0 || y < 0))) {
-      throw std::invalid_argument(
-          "invalid route-end coordinate pair for spatial sharding");
-    }
-    if (x_missing) {
+    if (!has_route_coordinate(x, y)) {
       continue;
     }
     min_x = std::min(min_x, x);
@@ -126,7 +118,7 @@ inline SpatialEdgeShards build_destination_spatial_edge_shards(
         static_cast<std::int64_t>(max_y) - min_y + 1);
     regular_shard_count = shards.regular_shard_count();
 
-    // A corrupt legacy artifact with two extremely distant coordinates must
+    // Corrupt input with two extremely distant coordinates must
     // not trigger an unbounded dense-grid allocation. Real FPGA tile grids are
     // compact; allow at least one million cells plus four per routing node.
     if (regular_shard_count > maximum_dense_spatial_cells(node_count)) {
@@ -201,6 +193,14 @@ inline void validate_routing_csr_sidecars(
     throw std::runtime_error(
         "routing CSR node sidecar arrays do not match vertex count");
   }
+  try {
+    routing::validate_coordinate_columns(sidecars.route_end_x,
+                                         sidecars.route_end_y,
+                                         vertex_count);
+  } catch (const std::invalid_argument& error) {
+    throw std::runtime_error(std::string("invalid routing CSR coordinates: ") +
+                             error.what());
+  }
   bool have_known_coordinate = false;
   std::int32_t known_min_x = std::numeric_limits<std::int32_t>::max();
   std::int32_t known_max_x = -1;
@@ -209,13 +209,7 @@ inline void validate_routing_csr_sidecars(
   for (std::size_t node = 0; node < vertex_count; ++node) {
     const std::int32_t x = sidecars.route_end_x[node];
     const std::int32_t y = sidecars.route_end_y[node];
-    const bool x_missing = x == kMissingRouteCoordinate;
-    const bool y_missing = y == kMissingRouteCoordinate;
-    if (x_missing != y_missing || (!x_missing && (x < 0 || y < 0))) {
-      throw std::runtime_error(
-          "routing CSR contains an invalid route-end coordinate pair");
-    }
-    if (!x_missing) {
+    if (has_route_coordinate(x, y)) {
       have_known_coordinate = true;
       known_min_x = std::min(known_min_x, x);
       known_max_x = std::max(known_max_x, x);
@@ -318,7 +312,7 @@ inline void validate_routing_csr_sidecars(
 // Validate the semantic half of the shard index as well as its structural
 // permutation: each compact edge ID must live in the shard selected by that
 // edge's destination coordinate. This check is intended for artifact creation
-// and full shard loading; node-sidecar-only BF11 loads deliberately skip the
+// and full shard loading; node-sidecar-only Bellman-Ford loads deliberately skip the
 // unused edge permutation.
 inline void validate_destination_spatial_edge_shards(
     const RoutingCsrSidecars& sidecars,

@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Prepare an AMD University Program cloud instance for building and profiling
-# the runtime-selectable PathFinder pipeline from the benchmark release asset.
+# Prepare an AMD University Program cloud instance for building the
+# runtime-selectable PathFinder pipeline from the benchmark release asset.
 
-readonly PROJECT_NAME="rips2026-amd-profiling"
-readonly PROJECT_REPO_URL="${PROJECT_REPO_URL:-https://github.com/amber-bajaj-1/rips2026-amd-profiling.git}"
+readonly PROJECT_NAME="rips2026-amd-routing"
+readonly PROJECT_REPO_URL="${PROJECT_REPO_URL:-https://github.com/amber-bajaj-1/rips2026-amd-routing.git}"
 readonly SCHEMA_REPO_URL="${SCHEMA_REPO_URL:-https://github.com/chipsalliance/fpga-interchange-schema.git}"
 readonly SCHEMA_REVISION="${SCHEMA_REVISION:-c985b4648e66414b250261c1ba4cbe45a2971b1c}"
 readonly CAPNP_VERSION="${CAPNP_VERSION:-1.4.0}"
 readonly ZLIB_VERSION="${ZLIB_VERSION:-1.3.1}"
 readonly DEVICE_NAME="xcvu3p"
 readonly BENCHMARK_RELEASE_TAG="benchmarks-v1"
-readonly BENCHMARK_ARCHIVE_URL="${BENCHMARK_ARCHIVE_URL:-https://github.com/amber-bajaj-1/rips2026-amd-profiling/releases/download/$BENCHMARK_RELEASE_TAG/xcvu3p.tar.gz}"
+readonly BENCHMARK_ARCHIVE_URL="${BENCHMARK_ARCHIVE_URL:-https://github.com/amber-bajaj-1/rips2026-amd-routing/releases/download/$BENCHMARK_RELEASE_TAG/xcvu3p.tar.gz}"
 readonly BENCHMARK_ARCHIVE_SIZE="${BENCHMARK_ARCHIVE_SIZE:-266644798}"
 readonly BENCHMARK_ARCHIVE_SHA256="${BENCHMARK_ARCHIVE_SHA256:-759bb5b4cdc2f48e319ca4e3f4c36e4dbd970205467a82d1b098d99713babd72}"
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -22,7 +22,6 @@ if (( $# > 1 )); then
   printf 'Usage: %s [ROOT]\n' "$(basename "$0")" >&2
   exit 2
 fi
-
 root_input="${1:-${RIPS_ROOT:-$PWD}}"
 mkdir -p -- "$root_input"
 readonly RIPS_ROOT="$(cd -- "$root_input" && pwd -P)"
@@ -155,188 +154,25 @@ configure_rocm_environment() {
   export LD_LIBRARY_PATH="$ROCM_ROOT/lib:$ROCM_ROOT/lib64:${LD_LIBRARY_PATH:-}"
 }
 
-detect_rocm_version() {
-  if [[ -n "${ROCM_VER:-}" ]]; then
-    :
-  elif [[ -s "$ROCM_ROOT/.info/version" ]]; then
-    read -r ROCM_VER <"$ROCM_ROOT/.info/version"
-  elif [[ "$(basename "$ROCM_ROOT")" =~ ^core-([0-9]+)\.([0-9]+)$ ]]; then
-    ROCM_VER="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.0"
-  else
-    ROCM_VER="$(
-      hipcc --version 2>/dev/null |
-        sed -nE 's/.*HIP version: *([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' |
-        head -n 1
-    )"
-  fi
-
-  if [[ "$ROCM_VER" =~ ^([0-9]+\.[0-9]+(\.[0-9]+)?) ]]; then
-    ROCM_VER="${BASH_REMATCH[1]}"
-  else
-    die "Could not determine a numeric ROCm version from $ROCM_ROOT."
-  fi
-  if [[ "$ROCM_VER" =~ ^[0-9]+\.[0-9]+$ ]]; then
-    ROCM_VER="$ROCM_VER.0"
-  fi
-  export ROCM_VER
-  log "Using ROCm version override $ROCM_VER for profiler compatibility"
-}
-
-locate_rocprofv3() {
-  local candidate
-  candidate="$(command -v rocprofv3 || true)"
-  if [[ -z "$candidate" && -x "$ROCM_ROOT/bin/rocprofv3" ]]; then
-    candidate="$ROCM_ROOT/bin/rocprofv3"
-  fi
-  if [[ -z "$candidate" ]]; then
-    candidate="$(
-      find "$ROCM_ROOT" -type f -name rocprofv3 -perm -u+x \
-        -print -quit 2>/dev/null || true
-    )"
-  fi
-  [[ -n "$candidate" ]] ||
-    die "rocprofv3 was not found at $ROCM_ROOT. Select an AUP image that includes ROCprofiler-SDK or set ROCM_PATH to that installation."
-  ROCPROFV3_PATH="$(cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename "$candidate")"
-  export ROCPROFV3_PATH
-  log "Using preinstalled rocprofv3 at $ROCPROFV3_PATH"
-}
-
-locate_rocprof_compute() {
-  local candidate
-  candidate="$(command -v rocprof-compute || true)"
-  if [[ -z "$candidate" && -x "$ROCM_ROOT/bin/rocprof-compute" ]]; then
-    candidate="$ROCM_ROOT/bin/rocprof-compute"
-  fi
-  if [[ -z "$candidate" ]]; then
-    candidate="$(
-      find "$ROCM_ROOT" -type f -name rocprof-compute -perm -u+x \
-        -print -quit 2>/dev/null || true
-    )"
-  fi
-  [[ -n "$candidate" ]] ||
-    die "rocprof-compute is required because this GPU exposes no public rocprofv3 wait counter."
-  ROCPROF_COMPUTE_PATH="$(cd -- "$(dirname -- "$candidate")" && pwd -P)/$(basename "$candidate")"
-  export ROCPROF_COMPUTE_PATH
-  log "Using rocprof-compute for the dedicated wait-counter replay"
-}
-
-validate_profiler_counter_support() {
-  log "Validating the available gfx115x profiling counters"
-  local available_counters="$CACHE_DIR/rocprofv3-available-counters.txt"
-  mkdir -p "$CACHE_DIR"
-  "$ROCPROFV3_PATH" --list-avail >"$available_counters" 2>&1 ||
-    die "rocprofv3 could not query the active GPU's counters. See $available_counters"
-
-  local counter
-  for counter in \
-    SQ_INSTS_VALU \
-    MeanOccupancyPerActiveCU \
-    L2CacheHit \
-    SQ_WAVE_CYCLES; do
-    grep -Fwq "$counter" "$available_counters" ||
-      die "The active ROCm installation does not expose $counter. See $available_counters"
-  done
-
-  if grep -Fwq SQ_WAIT_ANY "$available_counters"; then
-    WAIT_BACKEND="rocprofv3"
-    WAIT_COUNTER="SQ_WAIT_ANY"
-    COUNTER_CONFIG_FILE="$PROJECT_DIR/profiling-config/gfx115x-pmcs.yaml"
-  elif grep -Fwq SQ_WAIT_INST_ANY "$available_counters"; then
-    WAIT_BACKEND="rocprofv3"
-    WAIT_COUNTER="SQ_WAIT_INST_ANY"
-    COUNTER_CONFIG_FILE="$PROJECT_DIR/profiling-config/gfx115x-pmcs-wait-inst.yaml"
-    log "Using SQ_WAIT_INST_ANY because SQ_WAIT_ANY is unavailable"
-  else
-    locate_rocprof_compute
-    WAIT_BACKEND="rocprof-compute"
-    WAIT_COUNTER="SQ_WAIT_ANY"
-    COUNTER_CONFIG_FILE="$PROJECT_DIR/profiling-config/gfx115x-pmcs-no-wait.yaml"
-    log "Using a single-worker rocprof-compute replay because rocprofv3 exposes no wait counter"
-  fi
-  [[ -f "$COUNTER_CONFIG_FILE" ]] ||
-    die "Counter configuration not found: $COUNTER_CONFIG_FILE"
-  export WAIT_BACKEND WAIT_COUNTER COUNTER_CONFIG_FILE
-}
-
-locate_roctx_installation() {
-  local sdk_header
-  local sdk_library
-  sdk_header="$(
-    find "$ROCM_ROOT/include" /usr/include \
-      -follow -path '*/rocprofiler-sdk-roctx/roctx.h' -print -quit 2>/dev/null ||
-      true
-  )"
-  sdk_library="$(
-    find "$ROCM_ROOT/lib" "$ROCM_ROOT/lib64" \
-      /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu \
-      -follow -name 'librocprofiler-sdk-roctx.so*' -print -quit 2>/dev/null ||
-      true
-  )"
-  if [[ -n "$sdk_header" && -n "$sdk_library" ]]; then
-    ROCTX_STYLE="sdk"
-    ROCTX_INCLUDE_DIR="$(dirname "$(dirname "$sdk_header")")"
-    ROCTX_LIBRARY="$sdk_library"
-  else
-    local legacy_header
-    local legacy_library
-    legacy_header="$(
-      find "$ROCM_ROOT/roctracer/include" "$ROCM_ROOT/include" /usr/include \
-        -name roctx.h \
-        ! -path '*/rocprofiler-sdk-roctx/*' \
-        -print -quit 2>/dev/null || true
-    )"
-    legacy_library="$(
-      find "$ROCM_ROOT/lib" "$ROCM_ROOT/lib64" \
-        /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu \
-        -name 'libroctx64.so*' -print -quit 2>/dev/null || true
-    )"
-    if [[ -n "$legacy_header" && -n "$legacy_library" ]]; then
-      ROCTX_STYLE="legacy"
-      ROCTX_INCLUDE_DIR="$(dirname "$legacy_header")"
-      ROCTX_LIBRARY="$legacy_library"
-    else
-      ROCTX_STYLE="none"
-      ROCTX_INCLUDE_DIR="$ROCM_ROOT/include"
-      ROCTX_LIBRARY=""
-    fi
-  fi
-
-  if [[ -n "$ROCTX_LIBRARY" ]]; then
-    ROCM_LIBRARY_DIR="$(dirname "$ROCTX_LIBRARY")"
-    log "Using $ROCTX_STYLE ROCTx from $ROCTX_LIBRARY"
-  elif [[ -d "$ROCM_ROOT/lib" ]]; then
-    ROCM_LIBRARY_DIR="$ROCM_ROOT/lib"
-    log "ROCTx development files are unavailable; custom ranges will be disabled"
-  else
-    ROCM_LIBRARY_DIR="$ROCM_ROOT/lib64"
-    log "ROCTx development files are unavailable; custom ranges will be disabled"
-  fi
-  export ROCTX_STYLE ROCTX_INCLUDE_DIR ROCTX_LIBRARY ROCM_LIBRARY_DIR
-}
-
 persist_environment() {
   local environment_file="$PROJECT_DIR/environment.sh"
   cat >"$environment_file" <<EOF
 export RIPS_ROOT="$RIPS_ROOT"
 export LOCAL_PREFIX="$LOCAL_PREFIX"
 export ROCM_PATH="$ROCM_ROOT"
-export ROCM_VER="$ROCM_VER"
-export ROCPROFV3="$ROCPROFV3_PATH"
-export ROCPROF_COMPUTE="${ROCPROF_COMPUTE_PATH:-}"
-export PATH="\$LOCAL_PREFIX/bin:\$ROCM_PATH/bin:$(dirname "$ROCPROFV3_PATH"):\$PATH"
-export LD_LIBRARY_PATH="$LOCAL_PREFIX/lib:$ROCM_LIBRARY_DIR:\${LD_LIBRARY_PATH:-}"
+export PATH="\$LOCAL_PREFIX/bin:\$ROCM_PATH/bin:\$PATH"
+export LD_LIBRARY_PATH="$LOCAL_PREFIX/lib:$ROCM_ROOT/lib:$ROCM_ROOT/lib64:\${LD_LIBRARY_PATH:-}"
 export PKG_CONFIG_PATH="$LOCAL_PREFIX/lib/pkgconfig:\${PKG_CONFIG_PATH:-}"
-export RIPS_PROFILING_DIR="$PROJECT_DIR"
 export RIPS_BENCHMARK_DIR="$BENCHMARK_DIR"
 export RIPS_SCHEMA_DIR="$SCHEMA_DIR"
 EOF
 }
 
-prepare_profiling_repository() {
+prepare_project_repository() {
   if [[ "$SCRIPT_DIR" == "$PROJECT_DIR" ]]; then
-    log "Using the profiling repository at $PROJECT_DIR"
+    log "Using the routing repository at $PROJECT_DIR"
   elif [[ -e "$PROJECT_DIR" ]]; then
-    log "Using the existing profiling repository at $PROJECT_DIR"
+    log "Using the existing routing repository at $PROJECT_DIR"
     [[ -f "$PROJECT_DIR/Makefile" &&
        -d "$PROJECT_DIR/delta_stepping" &&
        -d "$PROJECT_DIR/bellman_ford" &&
@@ -346,14 +182,14 @@ prepare_profiling_repository() {
           -d "$SCRIPT_DIR/delta_stepping" &&
           -d "$SCRIPT_DIR/bellman_ford" &&
           -d "$SCRIPT_DIR/routing" ]]; then
-    log "Copying the current profiling working tree into $RIPS_ROOT"
+    log "Copying the current routing working tree into $RIPS_ROOT"
     cp -a -- "$SCRIPT_DIR" "$PROJECT_DIR"
   else
-    log "Cloning the profiling repository into $RIPS_ROOT"
+    log "Cloning the routing repository into $RIPS_ROOT"
     git clone "$PROJECT_REPO_URL" "$PROJECT_DIR"
   fi
 
-  mkdir -p "$PROJECT_DIR/profiling" "$BENCHMARK_DIR" "$PROJECT_DIR/dependencies"
+  mkdir -p "$BENCHMARK_DIR" "$PROJECT_DIR/dependencies"
 }
 
 prepare_schema_repository() {
@@ -510,16 +346,6 @@ DEVICE_FILE := $DEVICE_FILE
 DEVICE_GRAPH := $DEVICE_GRAPH
 SCHEMA_DIR := $SCHEMA_DIR
 ROCM_PATH := $ROCM_ROOT
-ROCM_VER := $ROCM_VER
-ROCM_LIB_DIR := $ROCM_LIBRARY_DIR
-ROCTX_STYLE := $ROCTX_STYLE
-ROCTX_INCLUDE_DIR := $ROCTX_INCLUDE_DIR
-ROCTX_LIBRARY := $ROCTX_LIBRARY
-ROCPROFV3 := $ROCPROFV3_PATH
-ROCPROF_COMPUTE := ${ROCPROF_COMPUTE_PATH:-}
-COUNTER_INPUT := $COUNTER_CONFIG_FILE
-WAIT_BACKEND := $WAIT_BACKEND
-WAIT_COUNTER := $WAIT_COUNTER
 INTERCHANGE_CPPFLAGS := -I$LOCAL_PREFIX/include
 INTERCHANGE_LIBS := -L$LOCAL_PREFIX/lib -Wl,-rpath,$LOCAL_PREFIX/lib -lcapnp -lkj -lz
 EOF
@@ -556,7 +382,7 @@ main() {
   validate_managed_paths
   validate_base_tools
   export PATH="$LOCAL_PREFIX/bin:$PATH"
-  prepare_profiling_repository
+  prepare_project_repository
   extract_benchmarks
 
   install_zlib
@@ -566,10 +392,6 @@ main() {
 
   configure_rocm_environment
   require_command hipcc
-  detect_rocm_version
-  locate_rocprofv3
-  validate_profiler_counter_support
-  locate_roctx_installation
 
   prepare_schema_repository
   generate_cpp_schemas
@@ -581,18 +403,12 @@ main() {
   log "Setup complete"
   printf '%s\n' \
     "Root: $RIPS_ROOT" \
-    "Profiling repository: $PROJECT_DIR" \
+    "Routing repository: $PROJECT_DIR" \
     "Benchmarks: $BENCHMARK_DIR" \
     "Device graph: $DEVICE_GRAPH" \
-    "ROCm version: $ROCM_VER" \
-    "rocprofv3: $ROCPROFV3_PATH" \
-    "Counter backend: rocprofv3" \
-    "Wait backend: $WAIT_BACKEND" \
-    "Wait counter: $WAIT_COUNTER" \
     "Environment: $PROJECT_DIR/environment.sh" \
     "Next: cd \"$PROJECT_DIR\" && make run BENCHMARK=logicnets_jscl" \
-    "Bellman-Ford: make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=bellman-ford" \
-    "Profile: make profile-all BENCHMARK=logicnets_jscl"
+    "Bellman-Ford: make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=bellman-ford"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

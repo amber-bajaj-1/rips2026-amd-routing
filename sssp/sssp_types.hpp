@@ -56,6 +56,9 @@ struct SsspCsrResult {
   bool target_reached = false;
   bool stopped_on_target = false;
   bool stopped_on_distance_limit = false;
+  // Set only when an engine's bounded traversal was rejected and the same
+  // query was restarted unbounded before materializing the final result.
+  bool used_unbounded_retry = false;
 
   std::vector<float> target_distances;
   std::vector<int> target_sources;

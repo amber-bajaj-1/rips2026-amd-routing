@@ -130,7 +130,8 @@ inline float compute_auto_delta(
     return clamp_auto_delta(1.0, multiplier);
   }
 
-  // Exact-unit graphs are the production routing case. The degree heuristic
+  // Graphs whose effective edge weights are all one are the production
+  // routing case. The degree heuristic
   // otherwise inflates their bucket width to wavefront_size / average_degree,
   // merging several integer distance levels without any weight information
   // that justifies doing so. Preserve the natural unit bucket and let the
@@ -152,7 +153,7 @@ inline float compute_auto_delta(
 
 }  // namespace delta_stepping_auto_detail
 
-// Exact-unit effective weights use a seed of one. Other nonzero weighted
+// Effective weights that are all one use a seed of one. Other nonzero weighted
 // graphs use the cuGraph-inspired graph-aware bucket-width seed:
 //   wavefront_size * average_effective_weight / average_out_degree.
 // The multiplier supports an explicit sweep around that seed. The overload

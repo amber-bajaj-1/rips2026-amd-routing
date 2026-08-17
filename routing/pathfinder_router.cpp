@@ -12,6 +12,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -41,7 +42,6 @@ struct Options {
   std::string interchange_to_csr = "./interchange_to_csr";
   std::string pathfinder = "./pathfinder";
   std::string routes_to_phys = "./routes_to_phys";
-  std::string pathfinder_profile_command;
 
   std::vector<std::string> pathfinder_args;
   bool allow_unrouted = true;
@@ -131,6 +131,38 @@ std::string require_positive_router_integer(std::string value,
   return value;
 }
 
+std::string require_bellman_ford_segment_rounds(std::string value) {
+  const int rounds =
+      parse_router_integer(value, "--bellman-ford-segment-rounds");
+  if (rounds != 1 && rounds != 2 && rounds != 4 && rounds != 8 &&
+      rounds != 16) {
+    throw std::runtime_error(
+        "--bellman-ford-segment-rounds requires one of 1, 2, 4, 8, or 16");
+  }
+  return value;
+}
+
+std::string require_bellman_ford_hip_graph_mode(std::string value) {
+  if (value != "auto" && value != "on" && value != "off") {
+    throw std::runtime_error(
+        "--bellman-ford-hip-graph requires auto, on, or off");
+  }
+  return value;
+}
+
+std::string require_bellman_ford_reset_threshold(std::string value) {
+  char* end = nullptr;
+  errno = 0;
+  const double threshold = std::strtod(value.c_str(), &end);
+  if (errno == ERANGE || end == value.c_str() || *end != '\0' ||
+      !std::isfinite(threshold) || !(threshold > 0.0) || threshold > 1.0) {
+    throw std::runtime_error(
+        "--bellman-ford-adaptive-reset-threshold requires a finite fraction in "
+        "(0, 1]");
+  }
+  return value;
+}
+
 void print_progress(int completed, int total, const std::string& label) {
   constexpr int kWidth = 28;
   const int filled = total == 0 ? kWidth : (completed * kWidth) / total;
@@ -142,14 +174,8 @@ void print_progress(int completed, int total, const std::string& label) {
 }
 
 void run_command(const std::vector<std::string>& argv,
-                 const char* label,
-                 const std::string& prefix = {}) {
-  std::string command = command_to_string(argv);
-  if (!prefix.empty()) {
-    command = prefix + " " + command;
-    std::cout << "[pathfinder-router] profiler command: " << command << "\n"
-              << std::flush;
-  }
+                 const char* label) {
+  const std::string command = command_to_string(argv);
   errno = 0;
   const auto started = std::chrono::steady_clock::now();
   const int status = std::system(command.c_str());
@@ -225,45 +251,35 @@ void print_usage(const char* program) {
       << "  --interchange-to-csr <path>    Converter executable. Env: INTERCHANGE_TO_CSR\n"
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
-      << "  Env PATHFINDER_PROFILE_COMMAND Shell prefix applied only to the inner pathfinder command.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <engine>         delta-step (default), delta-stepping, bellman-ford, or bf11.\n"
+      << "  --sssp-engine <engine>         delta-step (default) or bellman-ford.\n"
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
-      << "  --delta-force-legacy-parent    Forwarded for generic Delta parent-path A/B comparison.\n"
+      << "  --delta-force-legacy-parent    Forward legacy generic predecessor recovery.\n"
+      << "  --delta-force-generic          Bypass automatic exact-unit traversal.\n"
       << "  --delta <float|auto>           Forwarded to pathfinder.\n"
       << "  --delta-multiplier <float>     Forwarded for an automatic-delta sweep.\n"
       << "  --delta-controller <host-checked|reduced-round-trip>\n"
       << "                                 Forward generic Delta controller selection.\n"
       << "  --delta-controller-batch-size <positive-int>\n"
       << "                                 Forward reduced-round-trip controller batch size.\n"
-      << "  --delta-benchmark-weights <unit|all-light|all-heavy|mixed>\n"
-      << "                                 Forward a reproducible benchmark weight family.\n"
-      << "  --delta-benchmark-weight-seed <nonnegative-int>\n"
-      << "                                 Forward a seed; valid only with mixed weights.\n"
       << "  --unbounded                    Disable coordinate bounds for either engine.\n"
       << "  --bounds                       Explicitly enable coordinate bounds (the default).\n"
       << "  --bbox-margin-x <int>          Nonnegative horizontal margin. Default: 2\n"
       << "  --bbox-margin-y <int>          Nonnegative vertical margin. Default: 14\n"
-      << "  --no-unbounded-fallback        Keep unreachable queries bounded.\n"
-      << "  --bf11-unbounded               Compatibility alias for --unbounded.\n"
-      << "  --bf11-bbox-margin-x <int>     Compatibility margin alias.\n"
-      << "  --bf11-bbox-margin-y <int>     Compatibility margin alias.\n"
-      << "  --bf11-no-unbounded-fallback   Compatibility fallback alias.\n"
-      << "  --bf11-target-check-interval <positive-int>\n"
-      << "                                 Forward BF11 target polling interval.\n"
-      << "  --target-check-interval <positive-int>\n"
-      << "                                 Neutral spelling of the BF11 target interval.\n"
-      << "  --bf11-telemetry               Forward opt-in BF11 runtime telemetry.\n"
-      << "  --bellman-ford-telemetry       Alias for --bf11-telemetry.\n"
+      << "  --no-unbounded-fallback        Do not retry a bounded attempt lacking a reached-and-certified result.\n"
+      << "                                 A target without coordinates otherwise starts unbounded; here it is an error.\n"
+      << "  --bellman-ford-target-check-interval <positive-int>\n"
+      << "                                 Forward Bellman-Ford target polling interval.\n"
+      << "  --bellman-ford-segment-rounds <1|2|4|8|16>\n"
+      << "                                 Forward explicit-stream segment size.\n"
+      << "  --bellman-ford-hip-graph <auto|on|off> Forward HIP Graph replay policy.\n"
+      << "  --bellman-ford-adaptive-reset-threshold <fraction>\n"
+      << "                                 Forward dense reset threshold in (0, 1].\n"
+      << "  --bellman-ford-diagnostics     Forward opt-in Bellman-Ford diagnostics.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
       << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables automatic selection.\n"
-      << "  --capacity <int>               Forwarded for overuse diagnostics.\n"
-      << "  --max-pathfinder-iters <int>   Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --route-batch-size <count>     Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --present-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --present-multiplier <float>   Compatibility-only; accepted by pathfinder and ignored.\n"
-      << "  --history-factor <float>       Compatibility-only; accepted by pathfinder and ignored.\n";
+      << "  --capacity <int>               Forwarded for overuse diagnostics.\n";
 }
 
 Options parse_args(int argc, char** argv) {
@@ -286,14 +302,12 @@ Options parse_args(int argc, char** argv) {
   options.interchange_to_csr = env_or_default("INTERCHANGE_TO_CSR", "./interchange_to_csr");
   options.pathfinder = env_or_default("PATHFINDER_BIN", "./pathfinder");
   options.routes_to_phys = env_or_default("ROUTES_TO_PHYS", "./routes_to_phys");
-  options.pathfinder_profile_command =
-      env_or_default("PATHFINDER_PROFILE_COMMAND", "");
-  std::string delta_benchmark_weights;
-  bool delta_benchmark_weight_seed_provided = false;
   bool delta_telemetry = false;
-  bool bf11_telemetry = false;
+  bool delta_force_legacy_parent = false;
+  bool delta_force_generic = false;
+  bool bellman_ford_diagnostics = false;
   bool delta_specific_option_provided = false;
-  bool bf11_specific_option_provided = false;
+  bool bellman_ford_specific_option_provided = false;
   std::string sssp_engine = "delta-step";
 
   for (int i = 3; i < argc; ++i) {
@@ -324,81 +338,73 @@ Options parse_args(int argc, char** argv) {
       options.allow_unrouted = false;
     } else if (option == "--sssp-engine") {
       sssp_engine = require_value("--sssp-engine");
-      if (sssp_engine != "delta" && sssp_engine != "delta-step" &&
-          sssp_engine != "delta-stepping" &&
-          sssp_engine != "delta_stepping" &&
-          sssp_engine != "bellman-ford" &&
-          sssp_engine != "bellman_ford" && sssp_engine != "bf11" &&
-          sssp_engine != "bellman-ford-11" &&
-          sssp_engine != "bellman_ford_11") {
+      if (sssp_engine != "delta-step" && sssp_engine != "bellman-ford") {
         throw std::runtime_error(
             "invalid sssp-engine: " + sssp_engine +
-            " (expected delta-step/delta-stepping or bellman-ford/bf11)");
+            " (expected delta-step or bellman-ford)");
       }
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(sssp_engine);
-    } else if (option == "--use-delta-step" ||
-               option == "--delta-force-legacy-parent" ||
-               option == "--delta-force-generic") {
-      options.pathfinder_args.push_back(option);
-      delta_specific_option_provided = true;
     } else if (option == "--delta-telemetry") {
       if (!delta_telemetry) {
         options.pathfinder_args.push_back(option);
         delta_telemetry = true;
       }
       delta_specific_option_provided = true;
-    } else if (option == "--bf11-telemetry" ||
-               option == "--bellman-ford-telemetry") {
-      if (!bf11_telemetry) {
+    } else if (option == "--delta-force-generic") {
+      if (!delta_force_generic) {
         options.pathfinder_args.push_back(option);
-        bf11_telemetry = true;
+        delta_force_generic = true;
       }
-      bf11_specific_option_provided = true;
+      delta_specific_option_provided = true;
+    } else if (option == "--delta-force-legacy-parent") {
+      if (!delta_force_legacy_parent) {
+        options.pathfinder_args.push_back(option);
+        delta_force_legacy_parent = true;
+      }
+      delta_specific_option_provided = true;
+    } else if (option == "--bellman-ford-diagnostics") {
+      if (!bellman_ford_diagnostics) {
+        options.pathfinder_args.push_back(option);
+        bellman_ford_diagnostics = true;
+      }
+      bellman_ford_specific_option_provided = true;
     } else if (option == "--unbounded" || option == "--bounds" ||
-               option == "--bounded" || option == "--bf11-unbounded" ||
-               option == "--bf11-bounds" ||
-               option == "--no-unbounded-fallback" ||
-               option == "--bf11-no-unbounded-fallback") {
+               option == "--no-unbounded-fallback") {
       options.pathfinder_args.push_back(option);
-    } else if (option == "--delta-benchmark-weights") {
-      delta_benchmark_weights = require_value("--delta-benchmark-weights");
-      options.pathfinder_args.push_back(option);
-      options.pathfinder_args.push_back(delta_benchmark_weights);
-      delta_specific_option_provided = true;
-    } else if (option == "--delta-benchmark-weight-seed") {
-      const std::string seed =
-          require_value("--delta-benchmark-weight-seed");
-      delta_benchmark_weight_seed_provided = true;
-      options.pathfinder_args.push_back(option);
-      options.pathfinder_args.push_back(seed);
-      delta_specific_option_provided = true;
     } else if (option == "--bbox-margin-x" ||
-               option == "--bbox-margin-y" ||
-               option == "--bf11-bbox-margin-x" ||
-               option == "--bf11-bbox-margin-y") {
+               option == "--bbox-margin-y") {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_nonnegative_router_integer(
           require_value(option.c_str()), option.c_str()));
-    } else if (option == "--target-check-interval" ||
-               option == "--bf11-target-check-interval") {
+    } else if (option == "--bellman-ford-target-check-interval") {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_positive_router_integer(
           require_value(option.c_str()), option.c_str()));
-      bf11_specific_option_provided = true;
+      bellman_ford_specific_option_provided = true;
+    } else if (option == "--bellman-ford-segment-rounds") {
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(require_bellman_ford_segment_rounds(
+          require_value("--bellman-ford-segment-rounds")));
+      bellman_ford_specific_option_provided = true;
+    } else if (option == "--bellman-ford-hip-graph") {
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(require_bellman_ford_hip_graph_mode(
+          require_value("--bellman-ford-hip-graph")));
+      bellman_ford_specific_option_provided = true;
+    } else if (option == "--bellman-ford-adaptive-reset-threshold") {
+      options.pathfinder_args.push_back(option);
+      options.pathfinder_args.push_back(require_bellman_ford_reset_threshold(
+          require_value("--bellman-ford-adaptive-reset-threshold")));
+      bellman_ford_specific_option_provided = true;
     } else if (option == "--delta" ||
                option == "--delta-multiplier" ||
                option == "--delta-controller" ||
                option == "--delta-controller-batch-size" ||
-               option == "--max-pathfinder-iters" ||
                option == "--max-sssp-iters" ||
                option == "--net-limit" ||
-               option == "--route-batch-size" ||
                option == "--parallel-net-workers" ||
-               option == "--capacity" ||
-               option == "--present-factor" ||
-               option == "--present-multiplier" ||
-               option == "--history-factor") {
+               option == "--capacity") {
       options.pathfinder_args.push_back(option);
       options.pathfinder_args.push_back(require_value(option.c_str()));
       if (option == "--delta" || option == "--delta-multiplier" ||
@@ -414,24 +420,15 @@ Options parse_args(int argc, char** argv) {
   if (options.logical_netlist.empty()) {
     options.logical_netlist = infer_logical_netlist(options.input_phys);
   }
-  if (delta_benchmark_weight_seed_provided &&
-      delta_benchmark_weights != "mixed") {
-    throw std::runtime_error(
-        "--delta-benchmark-weight-seed requires "
-        "--delta-benchmark-weights mixed");
-  }
-  const bool bellman_ford_selected =
-      sssp_engine == "bellman-ford" || sssp_engine == "bellman_ford" ||
-      sssp_engine == "bf11" || sssp_engine == "bellman-ford-11" ||
-      sssp_engine == "bellman_ford_11";
+  const bool bellman_ford_selected = sssp_engine == "bellman-ford";
   if (bellman_ford_selected && delta_specific_option_provided) {
     throw std::runtime_error(
         "Delta-Stepping options cannot be used with "
         "--sssp-engine bellman-ford");
   }
-  if (!bellman_ford_selected && bf11_specific_option_provided) {
+  if (!bellman_ford_selected && bellman_ford_specific_option_provided) {
     throw std::runtime_error(
-        "BF11 target-check/telemetry options cannot be used with "
+        "Bellman-Ford controls cannot be used with "
         "--sssp-engine delta-step");
   }
   return options;
@@ -493,9 +490,7 @@ int main(int argc, char** argv) {
     pathfinder_cmd.insert(pathfinder_cmd.end(),
                           options.pathfinder_args.begin(),
                           options.pathfinder_args.end());
-    run_command(pathfinder_cmd,
-                "run PathFinder",
-                options.pathfinder_profile_command);
+    run_command(pathfinder_cmd, "run PathFinder");
     print_progress(2, 3, "PathFinder complete");
 
     std::vector<std::string> reconstruct_cmd = {

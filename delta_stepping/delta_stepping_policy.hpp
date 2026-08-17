@@ -23,6 +23,30 @@ enum class DeltaSteppingCsrCurrentMembershipMode {
   kGeneration,
 };
 
+inline constexpr std::uint64_t
+    kDeltaSteppingCsrMaxExactUnitRows = std::uint64_t{1} << 24;
+inline constexpr std::size_t
+    kDeltaSteppingCsrExactUnitWorkspaceBytesPerVertex = 24;
+inline constexpr std::size_t
+    kDeltaSteppingCsrGenericWorkspaceBytesPerVertex = 60;
+
+// Shared by runtime dispatch and PathFinder worker budgeting so allocation
+// estimates cannot drift from the actual exact-unit eligibility guards.
+constexpr bool delta_stepping_exact_unit_eligible(
+    bool automatic_execution,
+    bool automatic_parent,
+    bool all_edges_exact_unit,
+    bool has_vertex_costs,
+    std::int64_t rows,
+    bool unlimited_iterations,
+    bool no_progress_callback) noexcept {
+  return automatic_execution && automatic_parent && all_edges_exact_unit &&
+         !has_vertex_costs && rows > 0 &&
+         static_cast<std::uint64_t>(rows) <=
+             kDeltaSteppingCsrMaxExactUnitRows &&
+         unlimited_iterations && no_progress_callback;
+}
+
 // The host-checked controller preserves the established synchronization
 // behavior.  The reduced-round-trip controller is an explicit opt-in until it
 // has passed repeated target-GPU validation.

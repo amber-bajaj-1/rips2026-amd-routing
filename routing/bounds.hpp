@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace routing {
@@ -39,8 +40,26 @@ struct RoutingBoundsDerivation {
   bool target_missing_coordinates = false;
 };
 
+enum class RouteCoordinateKind {
+  kKnown,
+  kMissing,
+  kMalformed,
+};
+
+inline RouteCoordinateKind classify_route_coordinate(
+    std::int32_t x,
+    std::int32_t y) noexcept {
+  const bool missing_x = x == kMissingRouteCoordinate;
+  const bool missing_y = y == kMissingRouteCoordinate;
+  if (missing_x != missing_y || (!missing_x && (x < 0 || y < 0))) {
+    return RouteCoordinateKind::kMalformed;
+  }
+  return missing_x ? RouteCoordinateKind::kMissing
+                   : RouteCoordinateKind::kKnown;
+}
+
 inline bool has_route_coordinate(std::int32_t x, std::int32_t y) noexcept {
-  return x != kMissingRouteCoordinate && y != kMissingRouteCoordinate;
+  return classify_route_coordinate(x, y) == RouteCoordinateKind::kKnown;
 }
 
 inline void validate_bounds_config(const RoutingBoundsConfig& config) {
@@ -77,7 +96,7 @@ inline bool coordinate_in_bounds(std::int32_t x,
           y <= bounds.max_y);
 }
 
-// Shared destination-admission semantics for BF11 and Delta-Stepping. Unknown
+// Shared destination-admission semantics for Bellman-Ford and Delta-Stepping. Unknown
 // spill resources remain admissible; validation guarantees missing coordinates
 // occur as a pair.
 #if defined(__HIPCC__)
@@ -119,9 +138,8 @@ inline void validate_coordinate_columns(
   for (std::size_t node = 0; node < vertex_count; ++node) {
     const std::int32_t x = route_end_x[node];
     const std::int32_t y = route_end_y[node];
-    const bool missing_x = x == kMissingRouteCoordinate;
-    const bool missing_y = y == kMissingRouteCoordinate;
-    if (missing_x != missing_y || (!missing_x && (x < 0 || y < 0))) {
+    if (classify_route_coordinate(x, y) ==
+        RouteCoordinateKind::kMalformed) {
       throw std::invalid_argument(
           "routing coordinate sidecar contains a malformed coordinate pair "
           "at node " +
@@ -157,7 +175,13 @@ inline RoutingBoundsDerivation derive_query_bounds(
     }
     const std::int32_t x = route_end_x[static_cast<std::size_t>(node)];
     const std::int32_t y = route_end_y[static_cast<std::size_t>(node)];
-    if (!has_route_coordinate(x, y)) return false;
+    const RouteCoordinateKind coordinate_kind =
+        classify_route_coordinate(x, y);
+    if (coordinate_kind == RouteCoordinateKind::kMalformed) {
+      throw std::invalid_argument(
+          "routing terminal has a malformed coordinate pair");
+    }
+    if (coordinate_kind == RouteCoordinateKind::kMissing) return false;
     min_x = std::min(min_x, x);
     max_x = std::max(max_x, x);
     min_y = std::min(min_y, y);
@@ -167,7 +191,7 @@ inline RoutingBoundsDerivation derive_query_bounds(
   };
 
   // Unknown-coordinate sources are seeded and remain admissible, matching
-  // BF11. Known sources participate in the terminal envelope.
+  // Bellman-Ford. Known sources participate in the terminal envelope.
   for (const int source : sources) (void)include(source);
   for (const int target : targets) {
     if (!include(target)) {
@@ -194,40 +218,84 @@ inline RoutingBoundsDerivation derive_query_bounds(
   return result;
 }
 
+// Resolve an explicit per-call box before launching either engine. Missing
+// sources remain valid roots. A missing target may select an initially
+// unbounded attempt, but fallback never permits a known terminal outside the
+// caller's explicit box.
+inline RoutingBoundsDerivation resolve_explicit_query_bounds(
+    const std::vector<std::int32_t>& route_end_x,
+    const std::vector<std::int32_t>& route_end_y,
+    const std::vector<int>& sources,
+    const std::vector<int>& targets,
+    const RoutingQueryBounds& requested_bounds,
+    bool unbounded_fallback) {
+  validate_query_bounds(requested_bounds);
+  RoutingBoundsDerivation result;
+  result.bounds = requested_bounds;
+  if (!requested_bounds.enabled) {
+    result.bounds = {};
+    return result;
+  }
+  if (route_end_x.size() != route_end_y.size()) {
+    throw std::invalid_argument(
+        "routing coordinate sidecar columns have different lengths");
+  }
+
+  const auto coordinate = [&](int node) {
+    if (node < 0 || static_cast<std::size_t>(node) >= route_end_x.size()) {
+      throw std::out_of_range(
+          "bounded routing terminal is outside the coordinate sidecar");
+    }
+    const std::int32_t x = route_end_x[static_cast<std::size_t>(node)];
+    const std::int32_t y = route_end_y[static_cast<std::size_t>(node)];
+    const RouteCoordinateKind kind = classify_route_coordinate(x, y);
+    if (kind == RouteCoordinateKind::kMalformed) {
+      throw std::invalid_argument(
+          "bounded routing terminal has a malformed coordinate pair");
+    }
+    return std::pair<std::pair<std::int32_t, std::int32_t>,
+                     RouteCoordinateKind>{{x, y}, kind};
+  };
+
+  for (const int source : sources) {
+    const auto [position, kind] = coordinate(source);
+    if (kind == RouteCoordinateKind::kKnown &&
+        !coordinate_in_bounds(position.first, position.second,
+                              requested_bounds)) {
+      throw std::invalid_argument(
+          "bounded routing source lies outside the query box");
+    }
+  }
+  for (const int target : targets) {
+    const auto [position, kind] = coordinate(target);
+    if (kind == RouteCoordinateKind::kMissing) {
+      if (!unbounded_fallback) {
+        throw std::invalid_argument(
+            "cannot bound a target without routing coordinates; enable "
+            "unbounded fallback or select unbounded mode");
+      }
+      result.target_missing_coordinates = true;
+      result.bounds = {};
+      continue;
+    }
+    if (!coordinate_in_bounds(position.first, position.second,
+                              requested_bounds)) {
+      throw std::invalid_argument(
+          "bounded routing target lies outside the query box");
+    }
+  }
+  return result;
+}
+
 inline void validate_terminals_in_bounds(
     const std::vector<std::int32_t>& route_end_x,
     const std::vector<std::int32_t>& route_end_y,
     const std::vector<int>& sources,
     const std::vector<int>& targets,
     const RoutingQueryBounds& bounds) {
-  validate_query_bounds(bounds);
-  if (!bounds.enabled) return;
-  const auto coordinate = [&](int node) {
-    if (node < 0 || static_cast<std::size_t>(node) >= route_end_x.size() ||
-        route_end_x.size() != route_end_y.size()) {
-      throw std::out_of_range(
-          "bounded routing terminal is outside the coordinate sidecar");
-    }
-    return std::pair<std::int32_t, std::int32_t>{
-        route_end_x[static_cast<std::size_t>(node)],
-        route_end_y[static_cast<std::size_t>(node)]};
-  };
-  for (const int source : sources) {
-    const auto [x, y] = coordinate(source);
-    if (has_route_coordinate(x, y) && !coordinate_in_bounds(x, y, bounds)) {
-      throw std::invalid_argument(
-          "bounded routing source lies outside the query box");
-    }
-  }
-  for (const int target : targets) {
-    const auto [x, y] = coordinate(target);
-    if (!has_route_coordinate(x, y) ||
-        !coordinate_in_bounds(x, y, bounds)) {
-      throw std::invalid_argument(
-          "bounded routing target is missing coordinates or outside the "
-          "query box");
-    }
-  }
+  (void)resolve_explicit_query_bounds(route_end_x, route_end_y, sources,
+                                      targets, bounds,
+                                      /*unbounded_fallback=*/false);
 }
 
 }  // namespace routing
