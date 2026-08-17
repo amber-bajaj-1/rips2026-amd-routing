@@ -1,6 +1,7 @@
 #include "../pre-process/routing_csr_sidecars.hpp"
 #include "../routing/csr_artifact.hpp"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -266,9 +267,10 @@ void write_csr_v4_fixture(const std::filesystem::path& path,
   write_scalar(out, options.pair_high);
   write_scalar(out, options.pair_low);
   for (const std::uint64_t value :
-       {4ULL, 4ULL, 4ULL, 4ULL, 4ULL, 5ULL, 4ULL,
-        options.values_count, options.route_x_count, options.route_y_count,
-        options.base_cost_count}) {
+       std::array<std::uint64_t, 11>{
+           4, 4, 4, 4, 4, 5, 4, options.values_count,
+           options.route_x_count, options.route_y_count,
+           options.base_cost_count}) {
     write_scalar(out, value);
   }
   write_scalar(out, options.spatial_min_x);
