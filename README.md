@@ -62,7 +62,9 @@ The routed file is written to:
 benchmarks/<benchmark>_PathFinderFile.phys
 ```
 
-Each run prints wall-clock times for conversion, routing, and reconstruction.
+Each run shows compact progress bars and wall-clock times for conversion,
+loading, GPU upload, routing, and reconstruction. Detailed diagnostics are
+hidden by default.
 
 ## Run and time all four benchmarks
 
@@ -100,6 +102,14 @@ while the program also reports the individual pipeline-stage times.
 - `bellman-ford`
 
 Additional router options are passed with `PATHFINDER_ARGS`.
+
+Show the detailed conversion and routing diagnostics:
+
+```bash
+make run \
+  BENCHMARK=logicnets_jscl \
+  PATHFINDER_ARGS='--verbose'
+```
 
 Routing uses horizontal and vertical margins of 2 and 14 by default. Change
 them with:

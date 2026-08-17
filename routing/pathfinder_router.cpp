@@ -45,6 +45,7 @@ struct Options {
 
   std::vector<std::string> pathfinder_args;
   bool allow_unrouted = true;
+  bool verbose_output = false;
 };
 
 std::string env_or_default(const char* name, const char* fallback) {
@@ -174,11 +175,14 @@ void print_progress(int completed, int total, const std::string& label) {
 }
 
 void run_command(const std::vector<std::string>& argv,
-                 const char* label) {
+                 const char* label,
+                 bool show_output = true) {
   const std::string command = command_to_string(argv);
+  const std::string executed_command =
+      show_output ? command : command + " > /dev/null";
   errno = 0;
   const auto started = std::chrono::steady_clock::now();
-  const int status = std::system(command.c_str());
+  const int status = std::system(executed_command.c_str());
   const double elapsed_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - started)
           .count();
@@ -251,6 +255,7 @@ void print_usage(const char* program) {
       << "  --interchange-to-csr <path>    Converter executable. Env: INTERCHANGE_TO_CSR\n"
       << "  --pathfinder <path>            PathFinder executable. Env: PATHFINDER_BIN\n"
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
+      << "  --verbose                      Show detailed conversion and routing diagnostics.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
       << "  --sssp-engine <engine>         delta-step (default) or bellman-ford.\n"
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
@@ -334,6 +339,8 @@ Options parse_args(int argc, char** argv) {
       options.pathfinder = require_value("--pathfinder");
     } else if (option == "--routes-to-phys") {
       options.routes_to_phys = require_value("--routes-to-phys");
+    } else if (option == "--verbose") {
+      options.verbose_output = true;
     } else if (option == "--strict-routing") {
       options.allow_unrouted = false;
     } else if (option == "--sssp-engine") {
@@ -474,7 +481,7 @@ int main(int argc, char** argv) {
         "--metadata",
         metadata_path.string(),
     };
-    run_command(convert_cmd, "convert FPGAIF to CSR");
+    run_command(convert_cmd, "convert FPGAIF to CSR", options.verbose_output);
     print_progress(1, 3, "CSR conversion complete");
 
     std::vector<std::string> pathfinder_cmd = {
@@ -486,6 +493,9 @@ int main(int argc, char** argv) {
     };
     if (options.allow_unrouted) {
       pathfinder_cmd.push_back("--allow-unrouted");
+    }
+    if (!options.verbose_output) {
+      pathfinder_cmd.push_back("--concise");
     }
     pathfinder_cmd.insert(pathfinder_cmd.end(),
                           options.pathfinder_args.begin(),
@@ -503,7 +513,8 @@ int main(int argc, char** argv) {
     if (options.allow_unrouted) {
       reconstruct_cmd.push_back("--allow-unrouted-stubs");
     }
-    run_command(reconstruct_cmd, "reconstruct routed PhysicalNetlist");
+    run_command(reconstruct_cmd, "reconstruct routed PhysicalNetlist",
+                options.verbose_output);
     print_progress(3, 3, "routed PhysicalNetlist written");
 
     if (cleanup_work_dir) {

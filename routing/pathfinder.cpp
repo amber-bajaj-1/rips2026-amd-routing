@@ -1077,15 +1077,25 @@ std::uint64_t edge_key(int from, int to) {
 void print_pathfinder_progress(int iteration,
                                int max_iterations,
                                std::size_t completed_nets,
-                               std::size_t total_nets) {
+                               std::size_t total_nets,
+                               bool concise_output) {
   constexpr int kWidth = 30;
   const int filled =
       total_nets == 0 ? kWidth : static_cast<int>((completed_nets * kWidth) / total_nets);
-  std::cout << "[pathfinder] iter " << iteration << "/" << max_iterations << " [";
+  if (concise_output) {
+    std::cout << '\r' << "[pathfinder] routing [";
+  } else {
+    std::cout << "[pathfinder] iter " << iteration << "/" << max_iterations
+              << " [";
+  }
   for (int i = 0; i < kWidth; ++i) {
     std::cout << (i < filled ? '#' : '-');
   }
-  std::cout << "] " << completed_nets << "/" << total_nets << " nets\n" << std::flush;
+  std::cout << "] " << completed_nets << "/" << total_nets << " nets";
+  if (!concise_output || completed_nets >= total_nets) {
+    std::cout << '\n';
+  }
+  std::cout << std::flush;
 }
 
 hipStream_t create_worker_stream() {
@@ -1366,7 +1376,8 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
 
       if ((net_index + 1) == route_request_count ||
           (net_index + 1) % progress_interval == 0) {
-        print_pathfinder_progress(1, 1, net_index + 1, route_request_count);
+        print_pathfinder_progress(1, 1, net_index + 1, route_request_count,
+                                  options.concise_output);
       }
     }
     return;
@@ -1392,7 +1403,8 @@ void route_all_nets_with_workspace(const HostCsrF32& base_graph,
     if (completed == route_request_count ||
         completed - last_reported >= progress_interval) {
       last_reported = completed;
-      print_pathfinder_progress(1, 1, completed, route_request_count);
+      print_pathfinder_progress(1, 1, completed, route_request_count,
+                                options.concise_output);
     }
   };
 
@@ -1880,6 +1892,7 @@ void print_usage(const char* program) {
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (automatic).\n"
+      << "  --concise                       Show progress and component timings only.\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
@@ -2409,13 +2422,15 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     PathfinderOptions delta_options = options;
     if (delta_options.delta_auto) {
       delta_options.delta = resolved_automatic_delta;
-      std::ostringstream message;
-      message.precision(std::numeric_limits<float>::max_digits10);
-      message << "[pathfinder] resolved automatic delta="
-              << delta_options.delta
-              << " (wavefront=" << automatic_delta_wavefront_size
-              << ", multiplier=" << delta_options.delta_multiplier << ")\n";
-      std::cout << message.str();
+      if (!delta_options.concise_output) {
+        std::ostringstream message;
+        message.precision(std::numeric_limits<float>::max_digits10);
+        message << "[pathfinder] resolved automatic delta="
+                << delta_options.delta
+                << " (wavefront=" << automatic_delta_wavefront_size
+                << ", multiplier=" << delta_options.delta_multiplier << ")\n";
+        std::cout << message.str();
+      }
     }
     const bool may_use_exact_unit =
         !delta_options.delta_force_generic &&
@@ -2435,15 +2450,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         static_cast<std::int64_t>(base_graph.rows),
         delta_options.max_sssp_iterations < 0,
         true);
-    std::cout << "[pathfinder] Delta workspace policy="
-              << (exact_unit_eligible ? "exact-unit-eligible" : "generic")
-              << " (force_generic="
-              << (delta_options.delta_force_generic ? "true" : "false")
-              << ", force_legacy_parent="
-              << (delta_options.delta_force_legacy_parent ? "true" : "false")
-              << ")\n";
-    std::cout << "[pathfinder] validating and uploading Delta graph..."
-              << std::flush;
+    if (!delta_options.concise_output) {
+      std::cout << "[pathfinder] Delta workspace policy="
+                << (exact_unit_eligible ? "exact-unit-eligible" : "generic")
+                << " (force_generic="
+                << (delta_options.delta_force_generic ? "true" : "false")
+                << ", force_legacy_parent="
+                << (delta_options.delta_force_legacy_parent ? "true" : "false")
+                << ")\n"
+                << "[pathfinder] validating and uploading Delta graph..."
+                << std::flush;
+    }
     const auto graph_upload_started = std::chrono::steady_clock::now();
     std::shared_ptr<DeltaSteppingCsrGraph> shared_graph;
     if (delta_options.bounds.enabled) {
@@ -2454,25 +2471,32 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
       shared_graph =
           std::make_shared<DeltaSteppingCsrGraph>(base_graph, stream);
     }
-    std::cout << " done ("
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - graph_upload_started)
-                     .count()
-              << " s)\n"
-              << std::flush;
+    const double graph_upload_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      graph_upload_started)
+            .count();
+    if (delta_options.concise_output) {
+      std::cout << "[pathfinder] GPU graph upload: " << graph_upload_seconds
+                << " s\n";
+    } else {
+      std::cout << " done (" << graph_upload_seconds << " s)\n";
+    }
+    std::cout << std::flush;
     if (delta_options.parallel_net_workers == 0) {
       delta_options.parallel_net_workers = recommend_delta_worker_count(
           base_graph.rows, route_request_count, stream,
           exact_unit_eligible);
-      std::cout << "[pathfinder] auto-selected "
-                << delta_options.parallel_net_workers
-                << " delta-step worker(s) (workspace="
-                << (exact_unit_eligible ? "exact-unit" : "generic")
-                << ", force_generic="
-                << (delta_options.delta_force_generic ? "true" : "false")
-                << ", force_legacy_parent="
-                << (delta_options.delta_force_legacy_parent ? "true" : "false")
-                << ")\n";
+      if (!delta_options.concise_output) {
+        std::cout << "[pathfinder] auto-selected "
+                  << delta_options.parallel_net_workers
+                  << " delta-step worker(s) (workspace="
+                  << (exact_unit_eligible ? "exact-unit" : "generic")
+                  << ", force_generic="
+                  << (delta_options.delta_force_generic ? "true" : "false")
+                  << ", force_legacy_parent="
+                  << (delta_options.delta_force_legacy_parent ? "true" : "false")
+                  << ")\n";
+      }
     }
     DeltaSteppingCsrWorkspaceOptions workspace_options;
     workspace_options.parent_mode =
@@ -2492,11 +2516,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     if (delta_options.delta_telemetry) {
       delta_telemetry_records.resize(route_request_count);
     }
+    const auto routing_started = std::chrono::steady_clock::now();
     route_all_nets_with_workspace<DeltaSteppingCsrWorkspace>(
         base_graph, metadata, delta_options, routing_sidecars, stream,
         route_request_count, progress_interval, result.nets, shared_graph,
         workspace_options, query_capacity_hints,
         delta_options.delta_telemetry ? &delta_telemetry_records : nullptr);
+    std::cout << "[pathfinder] Delta-Stepping routing: "
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - routing_started)
+                     .count()
+              << " s\n";
     if (delta_options.delta_telemetry) {
       std::vector<DeltaSteppingCsrTelemetry> flattened_telemetry;
       std::size_t telemetry_query_count = 0;
@@ -2528,8 +2558,11 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     const auto bellman_ford_backend_started =
         std::chrono::steady_clock::now();
     PathfinderOptions bellman_ford_options = options;
-    std::cout << "[pathfinder] validating and uploading Bellman-Ford graph..."
-              << std::flush;
+    if (!bellman_ford_options.concise_output) {
+      std::cout
+          << "[pathfinder] validating and uploading Bellman-Ford graph..."
+          << std::flush;
+    }
     const auto graph_upload_started = std::chrono::steady_clock::now();
     if (!has_any_routing_sidecars || routing_sidecars == nullptr) {
       throw std::runtime_error(
@@ -2539,12 +2572,17 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     std::shared_ptr<BellmanFordCsrGraph> shared_graph =
         std::make_shared<BellmanFordCsrGraph>(
             base_graph, *routing_sidecars, stream);
-    std::cout << " done ("
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - graph_upload_started)
-                     .count()
-              << " s)\n"
-              << std::flush;
+    const double graph_upload_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      graph_upload_started)
+            .count();
+    if (bellman_ford_options.concise_output) {
+      std::cout << "[pathfinder] GPU graph upload: " << graph_upload_seconds
+                << " s\n";
+    } else {
+      std::cout << " done (" << graph_upload_seconds << " s)\n";
+    }
+    std::cout << std::flush;
     const std::size_t requested_workers =
         bellman_ford_options.parallel_net_workers;
     const BellmanFordWorkerRecommendation recommendation =
@@ -2561,24 +2599,26 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
             : std::min<std::size_t>(
                   bellman_ford_options.parallel_net_workers,
                   std::max<std::size_t>(1, route_request_count));
-    std::cout << "[pathfinder] Bellman-Ford workers requested=";
-    if (requested_workers == 0) {
-      std::cout << "auto";
-    } else {
-      std::cout << requested_workers;
-    }
-    std::cout << " selected=" << worker_count;
-    if (bellman_ford_options.bellman_ford_diagnostics) {
-      std::cout << " peak_workspace_bytes_estimate="
-                << recommendation.peak_workspace_device_bytes_estimate
-                << " free_device_bytes_before_workers="
-                << recommendation.free_device_bytes;
-      if (!recommendation.device_architecture.empty()) {
-        std::cout << " architecture=" << recommendation.device_architecture
-                  << " compute_units=" << recommendation.compute_unit_count;
+    if (!bellman_ford_options.concise_output) {
+      std::cout << "[pathfinder] Bellman-Ford workers requested=";
+      if (requested_workers == 0) {
+        std::cout << "auto";
+      } else {
+        std::cout << requested_workers;
       }
+      std::cout << " selected=" << worker_count;
+      if (bellman_ford_options.bellman_ford_diagnostics) {
+        std::cout << " peak_workspace_bytes_estimate="
+                  << recommendation.peak_workspace_device_bytes_estimate
+                  << " free_device_bytes_before_workers="
+                  << recommendation.free_device_bytes;
+        if (!recommendation.device_architecture.empty()) {
+          std::cout << " architecture=" << recommendation.device_architecture
+                    << " compute_units=" << recommendation.compute_unit_count;
+        }
+      }
+      std::cout << '\n';
     }
-    std::cout << '\n';
 
     reset_bellman_ford_runtime_stats();
     configure_bellman_ford_runtime_stats(
@@ -2600,16 +2640,22 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
         bellman_ford_options.bellman_ford_hip_graph_mode;
     workspace_options.adaptive_reset_threshold =
         bellman_ford_options.bellman_ford_adaptive_reset_threshold;
-    if (worker_count > 1) {
+    if (worker_count > 1 && !bellman_ford_options.concise_output) {
       std::cout
           << "[pathfinder] Bellman-Ford parallel workers use independent explicit "
              "streams with the segmented controller; the persistent "
              "cooperative controller remains single-worker only\n";
     }
+    const auto routing_started = std::chrono::steady_clock::now();
     route_all_nets_with_workspace<BellmanFordCsrWorkspace>(
         base_graph, metadata, bellman_ford_options, routing_sidecars, stream,
         route_request_count, progress_interval, result.nets, shared_graph,
         workspace_options, query_capacity_hints, nullptr);
+    std::cout << "[pathfinder] Bellman-Ford routing: "
+              << std::chrono::duration<double>(
+                     std::chrono::steady_clock::now() - routing_started)
+                     .count()
+              << " s\n";
 
     if (bellman_ford_options.bellman_ford_diagnostics) {
       const BellmanFordRuntimeStats stats = bellman_ford_runtime_stats();
@@ -2748,33 +2794,35 @@ PathfinderResult run_pathfinder(const HostCsrF32& base_graph,
     if (net.used_unbounded_retry) ++result.unbounded_fallback_retries;
   }
 
-  std::cout << "{\"type\":\"routing_bounds\",\"schema_version\":1"
-            << ",\"enabled\":"
-            << (options.bounds.enabled ? "true" : "false")
-            << ",\"margin_x\":" << options.bounds.margin_x
-            << ",\"margin_y\":" << options.bounds.margin_y
-            << ",\"unbounded_fallback\":"
-            << (options.bounds.unbounded_fallback ? "true" : "false")
-            << ",\"bounded_queries\":" << result.bounded_queries
-            << ",\"unbounded_missing_coordinate_queries\":"
-            << result.unbounded_missing_coordinate_queries
-            << ",\"unbounded_fallback_retries\":"
-            << result.unbounded_fallback_retries
-            << ",\"sample_query_bounds\":[";
-  std::size_t bounds_samples = 0;
-  for (std::size_t net_index = 0;
-       net_index < result.nets.size() && bounds_samples < 8;
-       ++net_index) {
-    const RoutedNet& net = result.nets[net_index];
-    if (!net.query_bounds.enabled) continue;
-    if (bounds_samples++ != 0) std::cout << ',';
-    std::cout << "{\"net_index\":" << net_index
-              << ",\"min_x\":" << net.query_bounds.min_x
-              << ",\"max_x\":" << net.query_bounds.max_x
-              << ",\"min_y\":" << net.query_bounds.min_y
-              << ",\"max_y\":" << net.query_bounds.max_y << '}';
+  if (!options.concise_output) {
+    std::cout << "{\"type\":\"routing_bounds\",\"schema_version\":1"
+              << ",\"enabled\":"
+              << (options.bounds.enabled ? "true" : "false")
+              << ",\"margin_x\":" << options.bounds.margin_x
+              << ",\"margin_y\":" << options.bounds.margin_y
+              << ",\"unbounded_fallback\":"
+              << (options.bounds.unbounded_fallback ? "true" : "false")
+              << ",\"bounded_queries\":" << result.bounded_queries
+              << ",\"unbounded_missing_coordinate_queries\":"
+              << result.unbounded_missing_coordinate_queries
+              << ",\"unbounded_fallback_retries\":"
+              << result.unbounded_fallback_retries
+              << ",\"sample_query_bounds\":[";
+    std::size_t bounds_samples = 0;
+    for (std::size_t net_index = 0;
+         net_index < result.nets.size() && bounds_samples < 8;
+         ++net_index) {
+      const RoutedNet& net = result.nets[net_index];
+      if (!net.query_bounds.enabled) continue;
+      if (bounds_samples++ != 0) std::cout << ',';
+      std::cout << "{\"net_index\":" << net_index
+                << ",\"min_x\":" << net.query_bounds.min_x
+                << ",\"max_x\":" << net.query_bounds.max_x
+                << ",\"min_y\":" << net.query_bounds.min_y
+                << ",\"max_y\":" << net.query_bounds.max_y << '}';
+    }
+    std::cout << "]}\n";
   }
-  std::cout << "]}\n";
 
   bool all_sinks_reached = true;
   for (std::size_t net_index = 0; net_index < route_request_count; ++net_index) {
@@ -3162,6 +3210,8 @@ int main(int argc, char** argv) {
         options.parallel_net_workers =
             routing::parse_size_arg(require_value("--parallel-net-workers"),
                                     "parallel-net-workers");
+      } else if (option == "--concise") {
+        options.concise_output = true;
       } else if (option == "--allow-unrouted") {
         allow_unrouted_routes = true;
       } else if (option == "--routes-out") {
@@ -3198,31 +3248,44 @@ int main(int argc, char** argv) {
     std::optional<routing::interchange::InterchangeArtifactPairId>
         csr_artifact_pair_id;
     routing::interchange::RoutingCsrSidecars routing_sidecars;
-    std::cout << "[pathfinder] loading CSR..." << std::flush;
+    if (!options.concise_output) {
+      std::cout << "[pathfinder] loading CSR..." << std::flush;
+    }
     const auto csr_load_started = std::chrono::steady_clock::now();
     HostCsrF32 graph = [&]() {
       return routing::load_csrbin(csr_path, &csr_artifact_pair_id,
                                   &routing_sidecars);
     }();
-    std::cout << " done ("
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - csr_load_started)
-                     .count()
-              << " s)\n"
-              << std::flush;
-    std::cout << "[pathfinder] loading routing metadata..." << std::flush;
+    const double csr_load_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      csr_load_started)
+            .count();
+    if (options.concise_output) {
+      std::cout << "[pathfinder] CSR load: " << csr_load_seconds << " s\n";
+    } else {
+      std::cout << " done (" << csr_load_seconds << " s)\n";
+    }
+    std::cout << std::flush;
+    if (!options.concise_output) {
+      std::cout << "[pathfinder] loading routing metadata..." << std::flush;
+    }
     const auto metadata_load_started = std::chrono::steady_clock::now();
     routing::RoutingMetadata metadata = [&]() {
       return routing::load_interchange_metadata(
           metadata_path,
           routing::InterchangeMetadataLoadMode::kRoutingOnly);
     }();
-    std::cout << " done ("
-              << std::chrono::duration<double>(
-                     std::chrono::steady_clock::now() - metadata_load_started)
-                     .count()
-              << " s)\n"
-              << std::flush;
+    const double metadata_load_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      metadata_load_started)
+            .count();
+    if (options.concise_output) {
+      std::cout << "[pathfinder] metadata load: " << metadata_load_seconds
+                << " s\n";
+    } else {
+      std::cout << " done (" << metadata_load_seconds << " s)\n";
+    }
+    std::cout << std::flush;
     routing::interchange::verify_interchange_publication(
         csr_path, metadata_path, publication_snapshot);
     routing::interchange::require_matching_interchange_pair_ids(
@@ -3250,8 +3313,10 @@ int main(int argc, char** argv) {
           throw std::runtime_error(
               "interchange CSR/metadata generation changed while routing");
         }
-        std::cout << "[pathfinder] loading route-output metadata..."
-                  << std::flush;
+        if (!options.concise_output) {
+          std::cout << "[pathfinder] loading route-output metadata..."
+                    << std::flush;
+        }
         const auto route_metadata_started = std::chrono::steady_clock::now();
         metadata = routing::load_interchange_metadata(
             metadata_path,
@@ -3261,13 +3326,17 @@ int main(int argc, char** argv) {
         routing::interchange::require_matching_interchange_pair_ids(
             csr_artifact_pair_id, metadata.artifact_pair_id,
             route_output_snapshot.generation);
-        std::cout << " done ("
-                  << std::chrono::duration<double>(
-                         std::chrono::steady_clock::now() -
-                         route_metadata_started)
-                         .count()
-                  << " s)\n"
-                  << std::flush;
+        const double route_metadata_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          route_metadata_started)
+                .count();
+        if (options.concise_output) {
+          std::cout << "[pathfinder] route metadata load: "
+                    << route_metadata_seconds << " s\n";
+        } else {
+          std::cout << " done (" << route_metadata_seconds << " s)\n";
+        }
+        std::cout << std::flush;
       }
       {
         routing::write_routes_jsonl_loaded_artifact(

@@ -48,8 +48,17 @@ void test_defaults_and_inference() {
           "default logical-netlist inference changed");
   require(options.allow_unrouted,
           "launcher should preserve partial-route compatibility by default");
+  require(!options.verbose_output,
+          "launcher should use concise output by default");
   require_forwarded(options, {},
                     "default bounded Delta-Stepping selection");
+}
+
+void test_verbose_output_is_opt_in() {
+  const Options options =
+      parse({"PathFinderFile", "in.phys", "out.phys", "--verbose"});
+  require(options.verbose_output, "--verbose did not enable detailed output");
+  require_forwarded(options, {}, "verbose output control");
 }
 
 void test_engine_neutral_bounds_forwarding() {
@@ -206,6 +215,7 @@ int main() {
     (void)&make_work_dir;
     (void)&require_file;
     test_defaults_and_inference();
+    test_verbose_output_is_opt_in();
     test_engine_neutral_bounds_forwarding();
     test_bellman_ford_controls();
     test_delta_controls();

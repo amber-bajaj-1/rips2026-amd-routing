@@ -1658,6 +1658,29 @@ __global__ void fill_edge_parent_target_paths_kernel(
   }
 }
 
+__global__ void build_target_path_offsets_kernel(
+    const int* path_lengths,
+    const int* path_status,
+    int target_count,
+    int* node_offsets,
+    int* edge_offsets) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int node_offset = 0;
+  int edge_offset = 0;
+  for (int i = 0; i < target_count; ++i) {
+    node_offsets[i] = node_offset;
+    edge_offsets[i] = edge_offset;
+    if (path_status[i] != 0 && path_lengths[i] > 0) {
+      node_offset += path_lengths[i];
+      edge_offset += path_lengths[i] - 1;
+    }
+  }
+  node_offsets[target_count] = node_offset;
+  edge_offsets[target_count] = edge_offset;
+}
+
 template <typename RowOffset,
           bool UseCurrentGenerations,
           bool TrackParents,
@@ -3920,18 +3943,14 @@ void extract_target_paths_to_result(
   result.target_path_nodes.resize(total_nodes);
   result.target_path_edges.resize(total_edges);
   if (total_nodes != 0) {
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_node_offsets.get(),
-                                      result.target_path_offsets.data(),
-                                      sssp_capacity::checked_bytes<int>(
-                                          target_offset_count),
-                                      hipMemcpyHostToDevice,
-                                      stream));
-    DS_DELTA_HIP_CHECK(hipMemcpyAsync(scratch.target_edge_offsets.get(),
-                                      result.target_edge_offsets.data(),
-                                      sssp_capacity::checked_bytes<int>(
-                                          target_offset_count),
-                                      hipMemcpyHostToDevice,
-                                      stream));
+    // Rebuild offsets from the device-resident measurement tuple. Copying
+    // pageable host offsets back to reused nonblocking gfx1151 streams can
+    // expose a prior query's offsets and make target kernels overlap slices.
+    build_target_path_offsets_kernel<<<1, 1, 0, stream>>>(
+        scratch.target_path_lengths.get(), scratch.target_path_status.get(),
+        target_count, scratch.target_node_offsets.get(),
+        scratch.target_edge_offsets.get());
+    DS_DELTA_HIP_CHECK(hipGetLastError());
     synchronize_explicit_stream(stream);
 
     scratch.ensure_compact_path_capacity(total_nodes, total_edges);
@@ -3980,12 +3999,6 @@ void extract_target_paths_to_result(
                                       hipMemcpyDeviceToHost,
                                       stream));
   }
-  DS_DELTA_HIP_CHECK(hipMemcpyAsync(result.target_sources.data(),
-                                    scratch.target_sources.get(),
-                                    sssp_capacity::checked_bytes<int>(
-                                        targets.size()),
-                                    hipMemcpyDeviceToHost,
-                                    stream));
   if (total_nodes != 0) {
     DS_DELTA_HIP_CHECK(hipMemcpyAsync(path_status.data(),
                                       scratch.target_path_status.get(),
@@ -4001,6 +4014,24 @@ void extract_target_paths_to_result(
           "delta predecessor path failed device validation for target index " +
           std::to_string(i));
     }
+    if (path_status[i] == 0 || path_lengths[i] <= 0 ||
+        !std::isfinite(result.target_distances[i])) {
+      result.target_sources[i] = -1;
+      continue;
+    }
+    const int node_begin = result.target_path_offsets[i];
+    const int node_end = result.target_path_offsets[i + 1];
+    if (node_begin < 0 || node_end <= node_begin ||
+        static_cast<std::size_t>(node_end) > result.target_path_nodes.size()) {
+      throw std::runtime_error(
+          "delta compact target path has invalid host offsets for target index " +
+          std::to_string(i));
+    }
+    // The first compact-path node is the authoritative source. Derive the
+    // redundant field after the synchronized path copy so every returned
+    // result satisfies that contract by construction.
+    result.target_sources[i] =
+        result.target_path_nodes[static_cast<std::size_t>(node_begin)];
   }
   result.target_reached = all_targets_reached;
 }

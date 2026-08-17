@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -611,6 +612,32 @@ void test_shared_graph_parallel_streams_and_offsets() {
   }
 }
 
+void test_compact_source_derivation_across_reuse(hipStream_t stream) {
+  const HostCsrF32 graph = make_outgoing_csr(
+      8, {{0, 4, 0.5f}, {1, 5, 0.75f}, {2, 4, 0.4f}, {3, 5, 0.6f},
+          {4, 6, 0.5f}, {4, 7, 1.5f}, {5, 6, 1.25f}, {5, 7, 0.5f}});
+  const std::array<std::vector<int>, 2> source_sets = {
+      std::vector<int>{0, 1}, std::vector<int>{2, 3}};
+  const std::vector<int> targets = {6, 7};
+
+  DeltaSteppingCsrWorkspaceOptions workspace_options;
+  workspace_options.execution_mode =
+      DeltaSteppingCsrExecutionMode::kForceGeneric;
+  DeltaSteppingCsrWorkspace workspace(
+      std::make_shared<DeltaSteppingCsrGraph>(graph, stream), stream,
+      workspace_options);
+
+  for (int iteration = 0; iteration < 128; ++iteration) {
+    const std::vector<int>& sources =
+        source_sets[static_cast<std::size_t>(iteration % source_sets.size())];
+    const DeltaSteppingCsrResult result = workspace.run(
+        sources, targets, 1.0f, -1, stream, nullptr, nullptr);
+    validate_target_paths(
+        "compact source reuse " + std::to_string(iteration), graph, sources,
+        targets, cpu_dijkstra(graph, sources), result);
+  }
+}
+
 void test_bounded_exact_unit_and_reuse(hipStream_t stream) {
   const HostCsrF32 graph = make_outgoing_csr(
       5, {{0, 4, 1.0f}, {0, 3, 1.0f}, {4, 1, 1.0f},
@@ -848,6 +875,7 @@ int main() {
     test_exact_unit_generic_guards(stream.get());
     test_compact_to_exact_allocation_transition(stream.get());
     test_shared_graph_parallel_streams_and_offsets();
+    test_compact_source_derivation_across_reuse(stream.get());
     test_bounded_exact_unit_and_reuse(stream.get());
     test_generic_bounds_controller_telemetry(stream.get());
     test_deterministic_cpu_oracle_and_generic_reuse(stream.get());

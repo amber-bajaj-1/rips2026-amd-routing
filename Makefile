@@ -232,7 +232,7 @@ endef
 run: pipeline device-graph
 	$(require_run_inputs)
 	$(require_regular_output)
-	./PathFinderFile "$(INPUT_PHYS)" "$(OUTPUT_PHYS)" \
+	@./PathFinderFile "$(INPUT_PHYS)" "$(OUTPUT_PHYS)" \
 		--logical-netlist "$(LOGICAL_NETLIST)" \
 		--device-graph "$(DEVICE_GRAPH)" $(RUN_PATHFINDER_ARGS)
 
@@ -250,6 +250,7 @@ help:
 	@echo "  Both engines are bounded by default with X=2, Y=14 margins and one unbounded fallback."
 	@echo "  Override with PATHFINDER_ARGS='--bbox-margin-x 4 --bbox-margin-y 20'."
 	@echo "  Disable bounds explicitly with PATHFINDER_ARGS='--unbounded'."
+	@echo "  Runs are concise by default; use PATHFINDER_ARGS='--verbose' for detailed diagnostics."
 	@echo
 	@echo "Run host policy/parser tests, then HIP engine parity tests on ROCm:"
 	@echo "  make test-host"
