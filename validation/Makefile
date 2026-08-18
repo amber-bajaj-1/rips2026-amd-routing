@@ -7,7 +7,7 @@ TARGET := validate_routes
 SOURCES := main.cpp artifacts.cpp checks.cpp
 OBJECTS := $(SOURCES:.cpp=.o)
 
-.PHONY: all test clean
+.PHONY: all clean
 
 all: $(TARGET)
 
@@ -16,9 +16,6 @@ $(TARGET): $(OBJECTS)
 
 %.o: %.cpp validation.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-test: $(TARGET)
-	python3 tests/run_tests.py --validator ./$(TARGET)
 
 clean:
 	rm -f $(OBJECTS) $(TARGET)

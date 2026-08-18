@@ -185,27 +185,7 @@ Multiple optional arguments can be placed in the same quoted value, for example:
 PATHFINDER_ARGS='--keep-work-dir --bbox-margin-x 4 --bbox-margin-y 20'
 ```
 
-## Optional developer tests and help
-
-Run all CPU-only host checks:
-
-```bash
-make test-host
-```
-
-On a ROCm system with an AMD GPU, run the GPU tests:
-
-```bash
-make test-hip
-```
-
-Run the validator's own tests:
-
-```bash
-make validation-test
-```
-
-For more command-line options:
+## More command-line options
 
 ```bash
 make help

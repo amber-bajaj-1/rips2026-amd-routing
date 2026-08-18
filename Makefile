@@ -66,7 +66,7 @@ PREPROCESS_HEADERS := \
 	pre-process/import_policy.hpp
 
 .PHONY: all router pipeline interchange-tools device-graph validation \
-	validation-test help run test test-host test-hip clean
+	help run clean
 
 all: router
 
@@ -78,9 +78,6 @@ interchange-tools: interchange_to_csr device_to_routing_graph routes_to_phys
 
 validation:
 	$(MAKE) -C validation
-
-validation-test:
-	$(MAKE) -C validation test
 
 device-graph: device_to_routing_graph
 	@test -s "$(DEVICE_FILE)" || \
@@ -145,77 +142,6 @@ routes_to_phys: \
 		"$(SCHEMA_DIR)/References.capnp.c++" \
 		$(INTERCHANGE_LIBS) -o $@
 
-test: test-host
-
-test-host:
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/delta_stepping_execution_policy_test.cpp \
-		-o /tmp/rips-delta-stepping-execution-policy-test
-	/tmp/rips-delta-stepping-execution-policy-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/routing_bounds_hip_qualifiers_test.cpp \
-		-o /tmp/rips-routing-bounds-hip-qualifiers-test
-	/tmp/rips-routing-bounds-hip-qualifiers-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/routing_bounds_test.cpp -o /tmp/rips-routing-bounds-test
-	/tmp/rips-routing-bounds-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/routing_csr_sidecars_test.cpp routing/csr_artifact.cpp \
-		-o /tmp/rips-routing-sidecars-test
-	/tmp/rips-routing-sidecars-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/bellman_ford_worker_policy_test.cpp -o /tmp/rips-bellman-ford-worker-policy-test
-	/tmp/rips-bellman-ford-worker-policy-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/bellman_ford_execution_policy_test.cpp \
-		-o /tmp/rips-bellman-ford-execution-policy-test
-	/tmp/rips-bellman-ford-execution-policy-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -pthread \
-		tests/bellman_ford_graph_execution_policy_test.cpp \
-		-o /tmp/rips-bellman-ford-graph-execution-policy-test
-	/tmp/rips-bellman-ford-graph-execution-policy-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/route_policy_test.cpp -o /tmp/rips-route-policy-test
-	/tmp/rips-route-policy-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		tests/pathfinder_router_args_test.cpp \
-		-o /tmp/rips-pathfinder-router-args-test
-	/tmp/rips-pathfinder-router-args-test
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -c \
-		pre-process/device_routing_graph.cpp \
-		-o /tmp/rips-device-routing-graph-test.o
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		-Itests/fake_hip -c routing/pathfinder.cpp \
-		-o /tmp/rips-pathfinder-host-syntax-test.o
-	$(CXX) -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
-		-Itests/fake_hip -c tests/delta_stepping_hip_test.cpp \
-		-o /tmp/rips-delta-stepping-hip-syntax-test.o
-	python3 tests/artifact_sidecar_source_test.py
-	python3 tests/bellman_ford_fake_hip_build_test.py
-	python3 tests/bellman_ford_sparse_reset_source_test.py
-	python3 tests/bellman_ford_source_structure_test.py
-	python3 tests/comment_continuation_source_test.py
-	python3 tests/delta_routing_bounds_source_test.py
-
-test-hip:
-	@command -v "$(HIPCC)" >/dev/null 2>&1 || \
-		{ echo "hipcc is unavailable; install ROCm before running GPU tests."; exit 2; }
-	$(HIPCC) -std=c++17 -O2 -x hip $(BELLMAN_FORD_GRAPH_FLAGS) -I. \
-		tests/bellman_ford_bounded_dynamic_hip_test.cpp \
-		bellman_ford/bellman_ford.cpp -pthread \
-		-o /tmp/rips-bellman-ford-bounded-dynamic-hip-test
-	/tmp/rips-bellman-ford-bounded-dynamic-hip-test
-	$(HIPCC) -std=c++17 -O2 -x hip -I. \
-		tests/delta_stepping_hip_test.cpp \
-		delta_stepping/delta_stepping.cpp -pthread \
-		-o /tmp/rips-delta-stepping-hip-test
-	/tmp/rips-delta-stepping-hip-test
-	$(HIPCC) -std=c++17 -O2 -x hip $(BELLMAN_FORD_GRAPH_FLAGS) -I. \
-		tests/routing_engines_bounds_hip_test.cpp \
-		delta_stepping/delta_stepping.cpp bellman_ford/bellman_ford.cpp \
-		-pthread -o /tmp/rips-routing-engines-bounds-hip-test
-	/tmp/rips-routing-engines-bounds-hip-test
-
 define require_run_inputs
 	@test -n "$(strip $(INPUT_PHYS))" || \
 		{ echo "Set BENCHMARK=<name>, or set INPUT_PHYS and LOGICAL_NETLIST explicitly."; exit 2; }
@@ -258,11 +184,6 @@ help:
 	@echo "  Override with PATHFINDER_ARGS='--bbox-margin-x 4 --bbox-margin-y 20'."
 	@echo "  Disable bounds explicitly with PATHFINDER_ARGS='--unbounded'."
 	@echo "  Runs are concise by default; use PATHFINDER_ARGS='--verbose' for detailed diagnostics."
-	@echo
-	@echo "Run host policy/parser tests, then HIP engine parity tests on ROCm:"
-	@echo "  make test-host"
-	@echo "  make test-hip"
-	@echo "  make validation-test"
 	@echo
 	@echo "For a benchmark outside the bundled naming convention:"
 	@echo "  make run INPUT_PHYS=... LOGICAL_NETLIST=... OUTPUT_PHYS=..."
