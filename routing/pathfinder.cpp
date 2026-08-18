@@ -1892,7 +1892,8 @@ void print_usage(const char* program) {
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
       << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (automatic).\n"
-      << "  --concise                       Show progress and component timings only.\n"
+      << "  --concise                       Show progress and component timings only (default).\n"
+      << "  --verbose                       Show detailed routing diagnostics.\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"
       << "  --routes-out <path>             Write routed PIP tree data as JSONL.\n";
 }
@@ -3212,6 +3213,8 @@ int main(int argc, char** argv) {
                                     "parallel-net-workers");
       } else if (option == "--concise") {
         options.concise_output = true;
+      } else if (option == "--verbose") {
+        options.concise_output = false;
       } else if (option == "--allow-unrouted") {
         allow_unrouted_routes = true;
       } else if (option == "--routes-out") {

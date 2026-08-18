@@ -134,7 +134,7 @@ struct RoutedNet {
 struct PathfinderOptions {
   SsspEngine sssp_engine = SsspEngine::kDeltaStep;
   // Keep progress and component timings while hiding configuration details.
-  bool concise_output = false;
+  bool concise_output = true;
   float delta = 1.0f;
   int max_sssp_iterations = -1;
   int capacity = 1;

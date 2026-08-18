@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CPP = (ROOT / "delta_stepping" / "delta_stepping.cpp").read_text()
 HEADER = (ROOT / "delta_stepping" / "delta_stepping.hpp").read_text()
 PATHFINDER = (ROOT / "routing" / "pathfinder.cpp").read_text()
+PATHFINDER_HEADER = (ROOT / "routing" / "pathfinder.hpp").read_text()
 
 
 def function_body(source: str, name: str) -> str:
@@ -157,6 +158,20 @@ class DeltaRoutingBoundsSourceTest(unittest.TestCase):
             coordinate_constructor,
         )
         self.assertLess(coordinate_constructor, unbounded_constructor)
+
+    def test_pathfinder_diagnostics_are_opt_in(self) -> None:
+        self.assertIn("bool concise_output = true;", PATHFINDER_HEADER)
+        self.assertIn('option == "--verbose"', PATHFINDER)
+        self.assertIn("options.concise_output = false;", PATHFINDER)
+
+        pathfinder_body = function_body(PATHFINDER, "PathfinderResult run_pathfinder")
+        bounds_record = pathfinder_body.index(
+            '\"{\\\"type\\\":\\\"routing_bounds\\\"'
+        )
+        concise_guard = pathfinder_body.rfind(
+            "if (!options.concise_output)", 0, bounds_record
+        )
+        self.assertGreaterEqual(concise_guard, 0)
 
 
 if __name__ == "__main__":

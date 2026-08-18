@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -176,10 +177,18 @@ void print_progress(int completed, int total, const std::string& label) {
 
 void run_command(const std::vector<std::string>& argv,
                  const char* label,
-                 bool show_output = true) {
+                 bool show_output = true,
+                 const std::filesystem::path& captured_output = {}) {
   const std::string command = command_to_string(argv);
+  if (!show_output && captured_output.empty()) {
+    throw std::logic_error(
+        "a capture file is required when command output is hidden");
+  }
   const std::string executed_command =
-      show_output ? command : command + " > /dev/null";
+      show_output
+          ? command
+          : command + " > " + shell_quote(captured_output.string()) +
+                " 2>&1";
   errno = 0;
   const auto started = std::chrono::steady_clock::now();
   const int status = std::system(executed_command.c_str());
@@ -188,6 +197,16 @@ void run_command(const std::vector<std::string>& argv,
           .count();
   const int system_errno = errno;
   if (status != 0) {
+    if (!show_output) {
+      {
+        std::ifstream captured(captured_output);
+        if (captured) {
+          std::cerr << captured.rdbuf();
+        }
+      }
+      std::error_code ignored;
+      std::filesystem::remove(captured_output, ignored);
+    }
     std::ostringstream out;
     out << label << " failed: ";
     if (status == -1) {
@@ -217,6 +236,10 @@ void run_command(const std::vector<std::string>& argv,
     }
     out << " while running " << command;
     throw std::runtime_error(out.str());
+  }
+  if (!show_output) {
+    std::error_code ignored;
+    std::filesystem::remove(captured_output, ignored);
   }
   std::cout << "[pathfinder-router] " << label << " wall time: "
             << elapsed_seconds << " s\n"
@@ -481,7 +504,8 @@ int main(int argc, char** argv) {
         "--metadata",
         metadata_path.string(),
     };
-    run_command(convert_cmd, "convert FPGAIF to CSR", options.verbose_output);
+    run_command(convert_cmd, "convert FPGAIF to CSR", options.verbose_output,
+                work_dir / "interchange_to_csr.log");
     print_progress(1, 3, "CSR conversion complete");
 
     std::vector<std::string> pathfinder_cmd = {
@@ -496,6 +520,8 @@ int main(int argc, char** argv) {
     }
     if (!options.verbose_output) {
       pathfinder_cmd.push_back("--concise");
+    } else {
+      pathfinder_cmd.push_back("--verbose");
     }
     pathfinder_cmd.insert(pathfinder_cmd.end(),
                           options.pathfinder_args.begin(),
@@ -514,7 +540,7 @@ int main(int argc, char** argv) {
       reconstruct_cmd.push_back("--allow-unrouted-stubs");
     }
     run_command(reconstruct_cmd, "reconstruct routed PhysicalNetlist",
-                options.verbose_output);
+                options.verbose_output, work_dir / "routes_to_phys.log");
     print_progress(3, 3, "routed PhysicalNetlist written");
 
     if (cleanup_work_dir) {

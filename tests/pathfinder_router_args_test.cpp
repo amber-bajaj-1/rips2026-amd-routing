@@ -61,6 +61,55 @@ void test_verbose_output_is_opt_in() {
   require_forwarded(options, {}, "verbose output control");
 }
 
+void test_concise_stage_output_is_hidden_but_failures_are_replayed() {
+  const std::filesystem::path log_path =
+      std::filesystem::temp_directory_path() /
+      ("rips-pathfinder-router-output-" +
+       std::to_string(std::chrono::steady_clock::now()
+                          .time_since_epoch()
+                          .count()) +
+       ".log");
+
+  std::ostringstream normal_output;
+  std::streambuf* const original_out = std::cout.rdbuf(normal_output.rdbuf());
+  try {
+    run_command({"/bin/sh", "-c",
+                 "printf hidden-standard-output; "
+                 "printf hidden-standard-error >&2"},
+                "quiet success", false, log_path);
+  } catch (...) {
+    std::cout.rdbuf(original_out);
+    throw;
+  }
+  std::cout.rdbuf(original_out);
+  require(normal_output.str().find("hidden-standard") == std::string::npos,
+          "concise stage output leaked into the wrapper output");
+  require(!std::filesystem::exists(log_path),
+          "successful concise stage left its capture file behind");
+
+  std::ostringstream failure_output;
+  std::streambuf* const original_error =
+      std::cerr.rdbuf(failure_output.rdbuf());
+  try {
+    require_rejected("failed concise stage", "exited with status 7", [&] {
+      run_command({"/bin/sh", "-c",
+                   "printf preserved-failure-detail >&2; exit 7"},
+                  "quiet failure", false, log_path);
+    });
+  } catch (...) {
+    std::cerr.rdbuf(original_error);
+    std::error_code ignored;
+    std::filesystem::remove(log_path, ignored);
+    throw;
+  }
+  std::cerr.rdbuf(original_error);
+  require(failure_output.str().find("preserved-failure-detail") !=
+              std::string::npos,
+          "concise stage discarded diagnostics after a failure");
+  require(!std::filesystem::exists(log_path),
+          "failed concise stage left its capture file behind");
+}
+
 void test_engine_neutral_bounds_forwarding() {
   const Options options = parse(
       {"PathFinderFile", "in.phys", "out.phys", "--sssp-engine",
@@ -209,13 +258,13 @@ void test_invalid_values_are_rejected() {
 int main() {
   try {
     // Suppressing the production main leaves these orchestration helpers
-    // intentionally uncalled in this parser-only test translation unit.
+    // intentionally uncalled in this parser-focused test translation unit.
     (void)&print_progress;
-    (void)&run_command;
     (void)&make_work_dir;
     (void)&require_file;
     test_defaults_and_inference();
     test_verbose_output_is_opt_in();
+    test_concise_stage_output_is_hidden_but_failures_are_replayed();
     test_engine_neutral_bounds_forwarding();
     test_bellman_ford_controls();
     test_delta_controls();
