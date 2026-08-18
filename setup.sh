@@ -354,9 +354,6 @@ EOF
 }
 
 compile_pipeline() {
-  log "Running host and HIP-declaration compatibility checks"
-  make -C "$PROJECT_DIR" test-host
-
   log "Compiling all preprocessing, routing, and post-processing binaries"
   make -C "$PROJECT_DIR" clean
   make -C "$PROJECT_DIR" -j"$JOBS" pipeline

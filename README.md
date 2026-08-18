@@ -189,14 +189,14 @@ DEVICE_GRAPH=/path/device.devicegraph
 
 ## Validate routing output
 
-Build and test the CPU-only validator:
+Build the CPU-only validator:
 
 ```bash
-make -C validation
-make -C validation test
+make validation
 ```
 
-The validator does not require a GPU.
+This command only compiles the validator; it does not run tests. The validator
+does not require a GPU.
 
 The simplest validation workflow is to keep the route work directory when
 routing:
@@ -236,7 +236,7 @@ Useful validator options include:
 
 Run `validation/validate_routes --help` for the full list.
 
-## Tests and help
+## Optional developer tests and help
 
 Run all CPU-only host checks:
 
@@ -248,6 +248,12 @@ On a ROCm system with an AMD GPU, run the GPU tests:
 
 ```bash
 make test-hip
+```
+
+Run the validator's own tests:
+
+```bash
+make validation-test
 ```
 
 For more command-line options:

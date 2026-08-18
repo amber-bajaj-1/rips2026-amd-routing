@@ -65,8 +65,8 @@ PREPROCESS_HEADERS := \
 	pre-process/gzip_io.hpp \
 	pre-process/import_policy.hpp
 
-.PHONY: all router pipeline interchange-tools device-graph help run test \
-	test-host test-hip clean
+.PHONY: all router pipeline interchange-tools device-graph validation \
+	validation-test help run test test-host test-hip clean
 
 all: router
 
@@ -75,6 +75,12 @@ router: PathFinderFile pathfinder
 pipeline: router interchange-tools
 
 interchange-tools: interchange_to_csr device_to_routing_graph routes_to_phys
+
+validation:
+	$(MAKE) -C validation
+
+validation-test:
+	$(MAKE) -C validation test
 
 device-graph: device_to_routing_graph
 	@test -s "$(DEVICE_FILE)" || \
@@ -256,6 +262,7 @@ help:
 	@echo "Run host policy/parser tests, then HIP engine parity tests on ROCm:"
 	@echo "  make test-host"
 	@echo "  make test-hip"
+	@echo "  make validation-test"
 	@echo
 	@echo "For a benchmark outside the bundled naming convention:"
 	@echo "  make run INPUT_PHYS=... LOGICAL_NETLIST=... OUTPUT_PHYS=..."
