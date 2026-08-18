@@ -1,13 +1,6 @@
 # RIPS AMD routing
 
-This repository routes FPGA Interchange designs on an AMD GPU and writes a
-routed PhysicalNetlist. You can:
-
-- run any of the four provided benchmarks;
-- choose Delta-Stepping or Bellman-Ford at runtime;
-- route your own PhysicalNetlist and logical netlist;
-- retain and validate routing results; and
-- run CPU-only checks or GPU tests.
+This repository was created as part of UCLA's Institute for Pure and Applied Mathematics (IPAM) Research in Industrial Projects for Students (RIPS) program for Advanced Micro Devices (AMD). The project centered around implementing Bellman-Ford and Delta-Stepping as routing algorithms on AMD client GPUs, with the goal of speeding up FPGA routing. 
 
 ## Set up
 
