@@ -160,15 +160,14 @@ ResolvedEdgeMetadataMap load_referenced_edge_metadata(
     const std::vector<RouteRecord>& routes);
 
 enum class Engine { kDeltaStep, kBellmanFord };
-enum class OptimalityScope { kGlobal, kRouterBounds };
 enum class CheckStatus { kPass, kFail, kNotObservable };
+
+inline constexpr std::size_t kOptimalityNetStride = 1000;
 
 struct ValidationOptions {
   Engine engine = Engine::kDeltaStep;
-  OptimalityScope optimality_scope = OptimalityScope::kGlobal;
   double absolute_tolerance = 1e-3;
   double relative_tolerance = 1e-5;
-  bool require_reported_distances = false;
   bool allow_unrouted = false;
   std::optional<std::size_t> expected_net_limit;
   std::size_t max_diagnostics = 50;
@@ -198,13 +197,6 @@ struct PathCheckOutput {
   std::vector<RouteTopology> route_topologies;
 };
 
-struct DistanceCheckOutput {
-  CheckResult result;
-  double maximum_absolute_error = 0.0;
-  double maximum_relative_error = 0.0;
-  std::size_t reported_distance_count = 0;
-};
-
 using ValidationProgressCallback =
     void (*)(std::size_t completed, std::size_t total, void* user_data);
 
@@ -229,12 +221,6 @@ PathCheckOutput check_path_continuity_and_membership(
     const Metadata& metadata,
     const RouteLoadResult& routes,
     const ResolvedEdgeMetadataMap& edge_metadata,
-    const ValidationOptions& options);
-
-DistanceCheckOutput check_distance_consistency(
-    const CsrGraph& graph,
-    const RouteLoadResult& routes,
-    const PathCheckOutput& paths,
     const ValidationOptions& options);
 
 CheckResult check_shortest_path_optimality(

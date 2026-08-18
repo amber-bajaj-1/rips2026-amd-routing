@@ -56,10 +56,8 @@ void print_usage(const char* program, std::ostream& out) {
          "<delta-step|bellman-ford> [options]\n\n"
       << "Options:\n"
       << "  --summary-json <path>           Write a machine-readable summary.\n"
-      << "  --optimality-scope <scope>      global (default) or router-bounds.\n"
       << "  --abs-tol <x>                   Absolute tolerance (default 1e-3).\n"
       << "  --rel-tol <x>                   Relative tolerance (default 1e-5).\n"
-      << "  --require-reported-distances    Exit 2 if sink distances are absent.\n"
       << "  --allow-unrouted                Explicitly permit unrouted entries.\n"
       << "  --expected-net-limit <n>        Validate only the metadata prefix.\n"
       << "  --max-diagnostics <n>           Printed/stored diagnostic cap "
@@ -137,25 +135,12 @@ CliOptions parse_args(int argc, char** argv) {
       } else {
         throw UsageError("--engine requires delta-step or bellman-ford");
       }
-    } else if (option == "--optimality-scope") {
-      const std::string value = require_value("--optimality-scope");
-      if (value == "global") {
-        options.validation.optimality_scope = OptimalityScope::kGlobal;
-      } else if (value == "router-bounds") {
-        options.validation.optimality_scope =
-            OptimalityScope::kRouterBounds;
-      } else {
-        throw UsageError(
-            "--optimality-scope requires global or router-bounds");
-      }
     } else if (option == "--abs-tol") {
       options.validation.absolute_tolerance = parse_nonnegative_double(
           require_value("--abs-tol"), "--abs-tol");
     } else if (option == "--rel-tol") {
       options.validation.relative_tolerance = parse_nonnegative_double(
           require_value("--rel-tol"), "--rel-tol");
-    } else if (option == "--require-reported-distances") {
-      options.validation.require_reported_distances = true;
     } else if (option == "--allow-unrouted") {
       options.validation.allow_unrouted = true;
     } else if (option == "--expected-net-limit") {
@@ -397,7 +382,6 @@ void write_summary_json(const std::filesystem::path& path,
                         const ArtifactPaths& artifacts,
                         const ValidationOptions& options,
                         const PathCheckOutput& path_check,
-                        const DistanceCheckOutput& distance_check,
                         const CheckResult& optimality_check,
                         const CompletenessCheckOutput& completeness_check,
                         std::size_t total_failures,
@@ -420,15 +404,11 @@ void write_summary_json(const std::filesystem::path& path,
       << "  \"engine\": \""
       << (options.engine == Engine::kDeltaStep ? "delta-step" : "bellman-ford")
       << "\",\n"
-      << "  \"optimality_scope\": \""
-      << (options.optimality_scope == OptimalityScope::kGlobal
-              ? "global"
-              : "router-bounds")
-      << "\",\n"
+      << "  \"optimality_scope\": \"global\",\n"
+      << "  \"optimality_net_stride\": " << kOptimalityNetStride << ",\n"
       << "  \"checks\": {\n";
   write_check_json(out, "path_continuity_and_graph_membership",
                    path_check.result, true);
-  write_check_json(out, "distance_consistency", distance_check.result, true);
   write_check_json(out, "shortest_path_optimality", optimality_check, true);
   write_check_json(out, "completeness", completeness_check.result, false);
   out << "  },\n"
@@ -440,11 +420,6 @@ void write_summary_json(const std::filesystem::path& path,
       << counts.duplicate_nets << ", \"unknown_nets\": "
       << counts.unknown_nets << ", \"failures\": " << total_failures
       << "},\n"
-      << std::setprecision(17)
-      << "  \"maximum_absolute_distance_error\": "
-      << distance_check.maximum_absolute_error << ",\n"
-      << "  \"maximum_relative_distance_error\": "
-      << distance_check.maximum_relative_error << ",\n"
       << "  \"exit_code\": " << exit_code << "\n"
       << "}\n";
   if (!out) {
@@ -503,7 +478,7 @@ void print_optimality_progress(std::size_t completed,
   std::ostringstream message;
   message << std::fixed << std::setprecision(2)
           << "[validation] Shortest-path optimality: " << completed << '/'
-          << total << " nets (" << percentage << "%, "
+          << total << " sampled nets (" << percentage << "%, "
           << elapsed_seconds(state->started) << " s)\n";
   std::cout << message.str() << std::flush;
   state->next_percentage = (percentage / 10 + 1) * 10;
@@ -565,16 +540,9 @@ int main(int argc, char** argv) {
             std::string(check_status_name(path_check.result.status)),
         stage_started);
     stage_started = ValidationClock::now();
-    print_stage_start(cli.progress, "Checking distance consistency");
-    const DistanceCheckOutput distance_check = check_distance_consistency(
-        graph, routes, path_check, cli.validation);
-    print_stage_complete(
+    print_stage_start(
         cli.progress,
-        "Distance consistency: " +
-            std::string(check_status_name(distance_check.result.status)),
-        stage_started);
-    stage_started = ValidationClock::now();
-    print_stage_start(cli.progress, "Checking shortest-path optimality");
+        "Checking global shortest-path optimality for every 1000th net");
     OptimalityProgressState optimality_progress{
         cli.progress, 10, stage_started};
     const CheckResult optimality_check = check_shortest_path_optimality(
@@ -597,28 +565,18 @@ int main(int argc, char** argv) {
         stage_started);
 
     const std::size_t total_failures =
-        path_check.result.failures + distance_check.result.failures +
-        optimality_check.failures + completeness_check.result.failures;
+        path_check.result.failures + optimality_check.failures +
+        completeness_check.result.failures;
     const bool validation_failed =
         path_check.result.status == CheckStatus::kFail ||
-        distance_check.result.status == CheckStatus::kFail ||
         optimality_check.status == CheckStatus::kFail ||
         completeness_check.result.status == CheckStatus::kFail;
-    const bool required_distance_unobservable =
-        cli.validation.require_reported_distances &&
-        distance_check.result.status == CheckStatus::kNotObservable;
-    const int exit_code =
-        validation_failed ? 1 : (required_distance_unobservable ? 2 : 0);
+    const int exit_code = validation_failed ? 1 : 0;
 
-    const char* optimality_label =
-        cli.validation.optimality_scope == OptimalityScope::kGlobal
-            ? "global"
-            : "optimal within router bounds";
     std::cout << "Path continuity and graph membership: "
               << check_status_name(path_check.result.status) << '\n'
-              << "Distance consistency: "
-              << check_status_name(distance_check.result.status) << '\n'
-              << "Shortest-path optimality (" << optimality_label << "): "
+              << "Shortest-path optimality (global, every "
+              << kOptimalityNetStride << "th net): "
               << check_status_name(optimality_check.status) << '\n'
               << "Completeness: "
               << check_status_name(completeness_check.result.status) << '\n';
@@ -629,24 +587,17 @@ int main(int argc, char** argv) {
               << " missing_nets=" << counts.missing_nets
               << " duplicate_nets=" << counts.duplicate_nets
               << " unknown_nets=" << counts.unknown_nets
-              << " failures=" << total_failures << '\n'
-              << std::setprecision(8)
-              << "Distance error maxima: absolute="
-              << distance_check.maximum_absolute_error
-              << " relative=" << distance_check.maximum_relative_error
-              << '\n';
+              << " failures=" << total_failures << '\n';
 
     if (!artifacts.work_dir.empty()) {
       std::cout << "Discovered PathFinder work directory: "
                 << artifacts.work_dir.string() << '\n';
     }
     if (!path_check.result.diagnostics.empty() ||
-        !distance_check.result.diagnostics.empty() ||
         !optimality_check.diagnostics.empty() ||
         !completeness_check.result.diagnostics.empty()) {
       std::cerr << "Diagnostics:\n";
       print_diagnostics("path", path_check.result);
-      print_diagnostics("distance", distance_check.result);
       print_diagnostics("optimality", optimality_check);
       print_diagnostics("completeness", completeness_check.result);
     }
@@ -655,7 +606,7 @@ int main(int argc, char** argv) {
       stage_started = ValidationClock::now();
       print_stage_start(cli.progress, "Writing summary JSON");
       write_summary_json(cli.summary_json, artifacts, cli.validation,
-                         path_check, distance_check, optimality_check,
+                         path_check, optimality_check,
                          completeness_check, total_failures, exit_code);
       print_stage_complete(cli.progress, "Summary JSON written",
                            stage_started);

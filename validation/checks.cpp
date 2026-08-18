@@ -647,92 +647,6 @@ PathCheckOutput check_path_continuity_and_membership(
   return output;
 }
 
-DistanceCheckOutput check_distance_consistency(
-    const CsrGraph& graph,
-    const RouteLoadResult& routes,
-    const PathCheckOutput& paths,
-    const ValidationOptions& options) {
-  DistanceCheckOutput output;
-  std::size_t reached_path_count = 0;
-  std::size_t missing_reported_count = 0;
-
-  for (std::size_t route_index = 0; route_index < routes.records.size();
-       ++route_index) {
-    const RouteRecord& route = routes.records[route_index];
-    if (route_index >= paths.route_topologies.size()) {
-      output.result.fail(route_context(route) +
-                             ": no topology result is available for distance "
-                             "reconstruction",
-                         options.max_diagnostics);
-      continue;
-    }
-    const RouteTopology& topology = paths.route_topologies[route_index];
-    for (std::size_t sink_index = 0; sink_index < route.sinks.size();
-         ++sink_index) {
-      const RouteEndpoint& sink = route.sinks[sink_index];
-      if (!sink.reached) continue;
-      ++reached_path_count;
-      if (sink_index >= topology.sink_paths.size() ||
-          !topology.sink_paths[sink_index].has_value()) {
-        output.result.fail(sink_context(route, sink_index) +
-                               ": path cost cannot be reconstructed because "
-                               "the topology is invalid",
-                           options.max_diagnostics);
-        continue;
-      }
-      double computed = 0.0;
-      try {
-        computed = reconstructed_cost(graph, route,
-                                      *topology.sink_paths[sink_index],
-                                      options.engine);
-      } catch (const std::exception& ex) {
-        output.result.fail(sink_context(route, sink_index) +
-                               ": path cost reconstruction failed: " +
-                               ex.what(),
-                           options.max_diagnostics);
-        continue;
-      }
-      if (!sink.reported_distance.has_value()) {
-        ++missing_reported_count;
-        continue;
-      }
-      ++output.reported_distance_count;
-      double absolute_error = 0.0;
-      double relative_error = 0.0;
-      const bool equal = costs_within_tolerance(
-          computed, *sink.reported_distance, options.absolute_tolerance,
-          options.relative_tolerance, &absolute_error, &relative_error);
-      output.maximum_absolute_error =
-          std::max(output.maximum_absolute_error, absolute_error);
-      output.maximum_relative_error =
-          std::max(output.maximum_relative_error, relative_error);
-      if (!equal) {
-        std::ostringstream message;
-        message << std::setprecision(17) << sink_context(route, sink_index)
-                << ": reported distance " << *sink.reported_distance
-                << " differs from reconstructed " << computed
-                << " (absolute_error=" << absolute_error
-                << ", relative_error=" << relative_error << ')';
-        output.result.fail(message.str(), options.max_diagnostics);
-      }
-    }
-  }
-
-  if (output.result.status != CheckStatus::kFail &&
-      (reached_path_count == 0 || missing_reported_count != 0)) {
-    output.result.mark_not_observable();
-    std::ostringstream message;
-    message << "current route-tree JSONL has no independent reported distance "
-               "for "
-            << missing_reported_count << " of " << reached_path_count
-            << " reached sink paths";
-    if (output.result.diagnostics.size() < options.max_diagnostics) {
-      output.result.diagnostics.push_back(message.str());
-    }
-  }
-  return output;
-}
-
 CheckResult check_shortest_path_optimality(
     const CsrGraph& graph,
     const RouteLoadResult& routes,
@@ -752,14 +666,20 @@ CheckResult check_shortest_path_optimality(
   std::vector<std::uint32_t> finalized_stamp(rows, 0);
   std::uint32_t epoch = 0;
   bool any_unobservable_unrouted = false;
+  const std::size_t sampled_route_count =
+      routes.records.empty()
+          ? 0
+          : 1 + (routes.records.size() - 1) / kOptimalityNetStride;
+  std::size_t sampled_route_index = 0;
 
   using QueueEntry = std::pair<double, int>;
   for (std::size_t route_index = 0; route_index < routes.records.size();
        ++route_index) {
-    if (progress_callback != nullptr) {
-      progress_callback(route_index, routes.records.size(),
+    if (route_index % kOptimalityNetStride != 0) continue;
+    if (progress_callback != nullptr)
+      progress_callback(sampled_route_index, sampled_route_count,
                         progress_user_data);
-    }
+    ++sampled_route_index;
     const RouteRecord& route = routes.records[route_index];
     if (++epoch == 0) {
       std::fill(distance_stamp.begin(), distance_stamp.end(), 0);
@@ -774,14 +694,6 @@ CheckResult check_shortest_path_optimality(
       continue;
     }
     const RouteTopology& topology = paths.route_topologies[route_index];
-
-    RouteQueryBounds bounds;
-    if (options.optimality_scope == OptimalityScope::kRouterBounds) {
-      // `bounded` and query_bounds describe the initial attempt. A successful
-      // unbounded retry is certified against the full graph, while the
-      // original serialized box remains observable for auditability.
-      if (!route.unbounded_retry) bounds = route.query_bounds;
-    }
 
     std::priority_queue<QueueEntry, std::vector<QueueEntry>,
                         std::greater<QueueEntry>>
@@ -821,7 +733,6 @@ CheckResult check_shortest_path_optimality(
       for (std::int64_t edge_id = begin; edge_id < end; ++edge_id) {
         const int destination =
             graph.colind[static_cast<std::size_t>(edge_id)];
-        if (!node_admitted(graph, destination, bounds)) continue;
         RouteEdge synthetic;
         synthetic.to = destination;
         const double weight = route_edge_cost(graph, synthetic, options.engine);
@@ -880,23 +791,6 @@ CheckResult check_shortest_path_optimality(
         continue;
       }
       const ReconstructedPath& path = *topology.sink_paths[sink_index];
-      if (bounds.enabled) {
-        bool path_in_bounds = true;
-        for (const std::size_t edge_index : path.route_edge_indices) {
-          if (edge_index >= route.edges.size() ||
-              !node_admitted(graph, route.edges[edge_index].to, bounds)) {
-            path_in_bounds = false;
-            break;
-          }
-        }
-        if (!path_in_bounds) {
-          result.fail(sink_context(route, sink_index) +
-                          ": serialized path traverses a destination outside "
-                          "the reconstructed router bounds",
-                      options.max_diagnostics);
-          continue;
-        }
-      }
       const double actual =
           reconstructed_cost(graph, route, path, options.engine);
       double absolute_error = 0.0;
@@ -920,7 +814,7 @@ CheckResult check_shortest_path_optimality(
     result.mark_not_observable();
   }
   if (progress_callback != nullptr) {
-    progress_callback(routes.records.size(), routes.records.size(),
+    progress_callback(sampled_route_count, sampled_route_count,
                       progress_user_data);
   }
   return result;

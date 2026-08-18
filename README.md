@@ -39,15 +39,6 @@ Bellman-Ford is the default engine:
 ```bash
 make run BENCHMARK=logicnets_jscl
 ```
-
-You can name it explicitly:
-
-```bash
-make run \
-  BENCHMARK=logicnets_jscl \
-  PATHFINDER_SSSP_ENGINE=bellman-ford
-```
-
 To use Delta-Stepping:
 
 ```bash
@@ -66,42 +57,67 @@ Each run shows compact progress bars and wall-clock times for conversion,
 loading, GPU upload, routing, and reconstruction. Detailed diagnostics are
 hidden by default.
 
-## Run and time all four benchmarks
+## Route your own files
 
-Run all four with Bellman-Ford:
-
-```bash
-for BENCHMARK_NAME in logicnets_jscl boom_med_pb vtr_mcml rosetta_fd; do
-  time -p make run \
-    BENCHMARK="$BENCHMARK_NAME" \
-    PATHFINDER_SSSP_ENGINE=bellman-ford \
-    OUTPUT_PHYS="benchmarks/${BENCHMARK_NAME}_bellman-ford_PathFinderFile.phys"
-done
-```
-
-Run all four with Delta-Stepping:
+Provide the input PhysicalNetlist, logical netlist, and output path:
 
 ```bash
-for BENCHMARK_NAME in logicnets_jscl boom_med_pb vtr_mcml rosetta_fd; do
-  time -p make run \
-    BENCHMARK="$BENCHMARK_NAME" \
-    PATHFINDER_SSSP_ENGINE=delta-step \
-    OUTPUT_PHYS="benchmarks/${BENCHMARK_NAME}_delta-step_PathFinderFile.phys"
-done
+make run \
+  INPUT_PHYS=/path/design_unrouted.phys \
+  LOGICAL_NETLIST=/path/design.netlist \
+  OUTPUT_PHYS=/path/design_routed.phys
 ```
 
-The explicit output names keep one engine's results from overwriting the
-other engine's results. Bash's built-in `time -p` reports the complete command
-time without requiring a separate timing program, while the router also reports
-the individual pipeline-stage times.
+The device graph produced by setup is used by default. To use another device
+graph, also set:
 
-## Useful optional arguments
+```bash
+DEVICE_GRAPH=/path/device.devicegraph
+```
 
-`PATHFINDER_SSSP_ENGINE` accepts:
+## Validate routing output
 
-- `bellman-ford` (default)
-- `delta-step`
+Build the CPU-only validator:
 
+```bash
+make validation
+```
+
+The simplest validation workflow is to keep the route work directory when
+routing:
+
+```bash
+make run \
+  BENCHMARK=logicnets_jscl \
+  PATHFINDER_ARGS='--keep-work-dir'
+
+validation/validate_routes \
+  --input benchmarks/logicnets_jscl_PathFinderFile.phys \
+  --engine bellman-ford \
+  --summary-json validation-summary.json
+```
+
+Use the same engine name for routing and validation. For Delta-Stepping output,
+pass `--engine delta-step`.
+
+To validate a route JSONL file directly, provide all three matching files from
+the same run:
+
+```bash
+validation/validate_routes \
+  --input /path/design.routes.jsonl \
+  --csr /path/design.csrbin \
+  --metadata /path/design.csrbin.ifmeta.bin \
+  --engine delta-step \
+  --summary-json validation-summary.json
+```
+
+Validation prints stage timings and periodic shortest-path progress by default.
+The shortest-path optimality stage checks one out of every 1,000 nets, starting
+with the first. This keeps validation practical on the larger benchmarks while
+still comparing sampled routes against the full routing graph.
+
+## Optional arguments
 Additional router options are passed with `PATHFINDER_ARGS`.
 
 Show the detailed conversion and routing diagnostics:
@@ -121,7 +137,7 @@ make run \
   PATHFINDER_ARGS='--bbox-margin-x 4 --bbox-margin-y 20'
 ```
 
-Disable coordinate bounds:
+Disable bounding boxes:
 
 ```bash
 make run \
@@ -163,80 +179,11 @@ make run \
   PATHFINDER_ARGS='--bellman-ford-diagnostics'
 ```
 
-Multiple optional arguments can be placed in the same quoted value:
+Multiple optional arguments can be placed in the same quoted value, for example:
 
 ```bash
 PATHFINDER_ARGS='--keep-work-dir --bbox-margin-x 4 --bbox-margin-y 20'
 ```
-
-## Route your own files
-
-Provide the input PhysicalNetlist, logical netlist, and output path:
-
-```bash
-make run \
-  INPUT_PHYS=/path/design_unrouted.phys \
-  LOGICAL_NETLIST=/path/design.netlist \
-  OUTPUT_PHYS=/path/design_routed.phys
-```
-
-The device graph produced by setup is used by default. To use another device
-graph, also set:
-
-```bash
-DEVICE_GRAPH=/path/device.devicegraph
-```
-
-## Validate routing output
-
-Build the CPU-only validator:
-
-```bash
-make validation
-```
-
-This command only compiles the validator; it does not run tests. The validator
-does not require a GPU.
-
-The simplest validation workflow is to keep the route work directory when
-routing:
-
-```bash
-make run \
-  BENCHMARK=logicnets_jscl \
-  PATHFINDER_ARGS='--keep-work-dir'
-
-validation/validate_routes \
-  --input benchmarks/logicnets_jscl_PathFinderFile.phys \
-  --engine bellman-ford \
-  --summary-json validation-summary.json
-```
-
-Use the same engine name for routing and validation. For Delta-Stepping output,
-pass `--engine delta-step`.
-
-To validate a route JSONL file directly, provide all three matching files from
-the same run:
-
-```bash
-validation/validate_routes \
-  --input /path/design.routes.jsonl \
-  --csr /path/design.csrbin \
-  --metadata /path/design.csrbin.ifmeta.bin \
-  --engine delta-step \
-  --summary-json validation-summary.json
-```
-
-Validation prints stage timings and periodic shortest-path progress by default.
-Useful validator options include:
-
-- `--no-progress` to suppress progress for scripted runs;
-- `--allow-unrouted` to permit explicitly incomplete routes;
-- `--optimality-scope router-bounds` to validate within the recorded routing
-  bounds, which is often much faster for large designs; and
-- `--max-diagnostics N` to limit printed diagnostics.
-
-Run `validation/validate_routes --help` for the full list.
 
 ## Optional developer tests and help
 

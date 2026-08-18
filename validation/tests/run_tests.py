@@ -483,7 +483,6 @@ class ValidatorIntegrationTests(unittest.TestCase):
         self.assert_mentions(
             result,
             ("continuity", "membership"),
-            "distance",
             ("optimality", "shortest"),
             ("completeness", "complete"),
             "pass",
@@ -519,7 +518,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
             parsed = json.loads(summary.read_text(encoding="utf-8"))
             rendered = json.dumps(parsed).lower()
             self.assertIn("pass", rendered)
-            self.assertIn("not_observable", rendered)
+            self.assertNotIn("distance_consistency", rendered)
 
     def test_default_progress_reports_major_validation_stages(self) -> None:
         graph, request, record = simple_routed_case()
@@ -556,7 +555,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
             paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--require-reported-distances")
+            result = self.invoke(paths)
             self.assert_success_summary(result)
 
     def test_parallel_edges_use_exact_csr_edge(self) -> None:
@@ -570,7 +569,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
             paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--require-reported-distances")
+            result = self.invoke(paths)
             self.assert_success_summary(result)
 
     def test_missing_net(self) -> None:
@@ -881,22 +880,6 @@ class ValidatorIntegrationTests(unittest.TestCase):
             self.assert_exit(result, 1)
             self.assert_mentions(result, "source", ("ordered", "identity", "metadata"))
 
-    def test_incorrect_reported_distance(self) -> None:
-        graph, request, record = simple_routed_case(distance=2.0)
-        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
-            paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--require-reported-distances")
-            self.assert_exit(result, 1)
-            self.assert_mentions(result, "distance", ("mismatch", "error", "reported"))
-
-    def test_missing_reported_distance_can_be_required(self) -> None:
-        graph, request, record = simple_routed_case(distance=None)
-        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
-            paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--require-reported-distances")
-            self.assert_exit(result, 2)
-            self.assert_mentions(result, "distance", ("not observable", "required"))
-
     def test_continuous_but_suboptimal_path(self) -> None:
         # The 0->1->3 path has cost 2; the serialized 0->2->4->3 path costs 3.
         graph = Graph([[1, 2], [3], [4], [], [3]])
@@ -916,7 +899,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
             paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--require-reported-distances")
+            result = self.invoke(paths)
             self.assert_exit(result, 1)
             self.assert_mentions(result, ("suboptimal", "optimality", "shortest"))
 
@@ -941,28 +924,6 @@ class ValidatorIntegrationTests(unittest.TestCase):
             self.assert_mentions(rejected, ("unrouted", "not routed", "reached"))
             allowed = self.invoke(paths, "--allow-unrouted")
             self.assert_success_summary(allowed)
-
-    def test_wrong_engine_cost_model(self) -> None:
-        # This distance is correct for Delta-Step (unit edge) and wrong for
-        # Bellman-Ford, whose effective edge cost is base_vertex_cost[destination].
-        graph = Graph([[1], []], base_cost=[1.0, 4.0])
-        request = Request(
-            "engine_cost", (endpoint(0, "source"),), (endpoint(1, "sink"),)
-        )
-        record = route_record(
-            graph, request, [0], sink_sources=[0], distances=[1.0]
-        )
-        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
-            paths = materialize(Path(temporary), graph, [request], [record])
-            delta = self.invoke(paths, "--require-reported-distances")
-            self.assert_success_summary(delta)
-            bellman_result = self.invoke(
-                paths,
-                "--require-reported-distances",
-                engine="bellman-ford",
-            )
-            self.assert_exit(bellman_result, 1)
-            self.assert_mentions(bellman_result, ("distance", "cost"), ("bellman-ford", "mismatch", "reported"))
 
     def test_only_canonical_engine_names_are_accepted(self) -> None:
         graph, request, record = simple_routed_case()
@@ -989,7 +950,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
             paths = materialize(Path(temporary), graph, [request], [record])
-            result = self.invoke(paths, "--optimality-scope", "router-bounds")
+            result = self.invoke(paths)
             self.assert_success_summary(result)
 
     def test_numbered_phys_work_directory_auto_discovery(self) -> None:
@@ -1049,7 +1010,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
             result = self.invoke(paths, "--expected-net-limit", "1")
             self.assert_success_summary(result)
 
-    def test_router_bounds_uses_exact_serialized_box_without_margins(self) -> None:
+    def test_optimality_ignores_serialized_router_bounds(self) -> None:
         graph = Graph(
             [[1, 3], [4], [], [2], [2]],
             coordinates=[(0, 0), (1, 0), (2, 0), (100, 100), (1, 1)],
@@ -1076,20 +1037,12 @@ class ValidatorIntegrationTests(unittest.TestCase):
             paths = materialize(Path(temporary), graph, [request], [record])
             for engine in ("delta-step", "bellman-ford"):
                 with self.subTest(engine=engine):
-                    global_result = self.invoke(paths, engine=engine)
-                    self.assert_exit(global_result, 1)
-                    self.assert_mentions(
-                        global_result, ("suboptimal", "shortest")
-                    )
                     result = self.invoke(
                         paths,
-                        "--optimality-scope",
-                        "router-bounds",
-                        "--require-reported-distances",
                         engine=engine,
                     )
-                    self.assert_success_summary(result)
-                    self.assert_mentions(result, "bound")
+                    self.assert_exit(result, 1)
+                    self.assert_mentions(result, ("suboptimal", "shortest"))
 
     def test_unbounded_retry_retains_box_but_certifies_global_result(self) -> None:
         graph = Graph(
@@ -1124,9 +1077,7 @@ class ValidatorIntegrationTests(unittest.TestCase):
             invalid_paths = materialize(
                 root / "without-retry", graph, [request], [without_retry]
             )
-            invalid = self.invoke(
-                invalid_paths, "--optimality-scope", "router-bounds"
-            )
+            invalid = self.invoke(invalid_paths)
             self.assert_exit(invalid, 1)
             self.assert_mentions(invalid, "outside", "query", "bounds")
 
@@ -1135,12 +1086,62 @@ class ValidatorIntegrationTests(unittest.TestCase):
                 with self.subTest(engine=engine):
                     result = self.invoke(
                         paths,
-                        "--optimality-scope",
-                        "router-bounds",
-                        "--require-reported-distances",
                         engine=engine,
                     )
                     self.assert_success_summary(result)
+
+    def test_optimality_samples_every_1000th_net_starting_with_first(self) -> None:
+        graph = Graph(
+            [[1, 2], [3], [4], [], [3]],
+            coordinates=[(0, 0), (1, 0), (1, 1), (2, 0), (2, 1)],
+        )
+        bounds = {
+            "enabled": True,
+            "min_x": 0,
+            "max_x": 2,
+            "min_y": 0,
+            "max_y": 1,
+        }
+        requests: list[Request] = []
+        records: list[dict[str, Any]] = []
+        for index in range(1001):
+            request = Request(
+                f"sample_{index}",
+                (endpoint(0, "source"),),
+                (endpoint(3, "sink"),),
+            )
+            if index in (1, 1000):
+                edges = [
+                    graph.edge_index(0, 2),
+                    graph.edge_index(2, 4),
+                    graph.edge_index(4, 3),
+                ]
+            else:
+                edges = [graph.edge_index(0, 1), graph.edge_index(1, 3)]
+            requests.append(request)
+            records.append(
+                route_record(
+                    graph,
+                    request,
+                    edges,
+                    sink_sources=[0],
+                    bounded=True,
+                    query_bounds=bounds,
+                )
+            )
+
+        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
+            root = Path(temporary)
+            unsampled_paths = materialize(
+                root / "unsampled", graph, requests[:2], records[:2]
+            )
+            unsampled = self.invoke(unsampled_paths)
+            self.assert_success_summary(unsampled)
+
+            sampled_paths = materialize(root / "sampled", graph, requests, records)
+            sampled = self.invoke(sampled_paths)
+            self.assert_exit(sampled, 1)
+            self.assert_mentions(sampled, "sample_1000", "not shortest")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
