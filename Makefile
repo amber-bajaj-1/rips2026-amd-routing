@@ -18,7 +18,7 @@ BENCHMARK_DIR ?= $(CURDIR)/benchmarks
 SCHEMA_DIR ?= $(CURDIR)/dependencies/fpga-interchange-schema/interchange
 
 BENCHMARK ?=
-PATHFINDER_SSSP_ENGINE ?= delta-step
+PATHFINDER_SSSP_ENGINE ?= bellman-ford
 SUPPORTED_SSSP_ENGINES := delta-step bellman-ford
 ifeq ($(filter $(PATHFINDER_SSSP_ENGINE),$(SUPPORTED_SSSP_ENGINES)),)
 $(error PATHFINDER_SSSP_ENGINE must be one of: $(SUPPORTED_SSSP_ENGINES))
@@ -245,8 +245,9 @@ help:
 	@echo
 	@echo "Run a bundled benchmark:"
 	@echo "  make run BENCHMARK=logicnets_jscl"
-	@echo "  make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=bellman-ford"
-	@echo "  Delta defaults to 1; use DELTA=auto or DELTA=<positive-number> to override it."
+	@echo "  Bellman-Ford is the default engine."
+	@echo "  make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=delta-step"
+	@echo "  For Delta-Stepping, DELTA defaults to 1; use DELTA=auto or DELTA=<positive-number> to override it."
 	@echo "  Both engines are bounded by default with X=2, Y=14 margins and one unbounded fallback."
 	@echo "  Override with PATHFINDER_ARGS='--bbox-margin-x 4 --bbox-margin-y 20'."
 	@echo "  Disable bounds explicitly with PATHFINDER_ARGS='--unbounded'."

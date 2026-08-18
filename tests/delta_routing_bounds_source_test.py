@@ -160,6 +160,10 @@ class DeltaRoutingBoundsSourceTest(unittest.TestCase):
         self.assertLess(coordinate_constructor, unbounded_constructor)
 
     def test_pathfinder_diagnostics_are_opt_in(self) -> None:
+        self.assertIn(
+            "SsspEngine sssp_engine = SsspEngine::kBellmanFord;",
+            PATHFINDER_HEADER,
+        )
         self.assertIn("bool concise_output = true;", PATHFINDER_HEADER)
         self.assertIn('option == "--verbose"', PATHFINDER)
         self.assertIn("options.concise_output = false;", PATHFINDER)

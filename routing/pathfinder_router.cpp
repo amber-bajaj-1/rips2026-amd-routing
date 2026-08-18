@@ -280,7 +280,7 @@ void print_usage(const char* program) {
       << "  --routes-to-phys <path>        Route reconstructor. Env: ROUTES_TO_PHYS\n"
       << "  --verbose                      Show detailed conversion and routing diagnostics.\n"
       << "  --strict-routing               Fail instead of writing partial routes.\n"
-      << "  --sssp-engine <engine>         delta-step (default) or bellman-ford.\n"
+      << "  --sssp-engine <engine>         bellman-ford (default) or delta-step.\n"
       << "  --delta-telemetry              Forward opt-in Delta-Stepping runtime telemetry.\n"
       << "  --delta-force-legacy-parent    Forward legacy generic predecessor recovery.\n"
       << "  --delta-force-generic          Bypass automatic exact-unit traversal.\n"
@@ -336,7 +336,7 @@ Options parse_args(int argc, char** argv) {
   bool bellman_ford_diagnostics = false;
   bool delta_specific_option_provided = false;
   bool bellman_ford_specific_option_provided = false;
-  std::string sssp_engine = "delta-step";
+  std::string sssp_engine = "bellman-ford";
 
   for (int i = 3; i < argc; ++i) {
     const std::string option = argv[i];

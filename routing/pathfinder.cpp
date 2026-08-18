@@ -1864,7 +1864,7 @@ void print_usage(const char* program) {
       << "Usage:\n"
       << "  " << program << " <graph.csrbin> [metadata.ifmeta.bin] [options]\n\n"
       << "Options:\n"
-      << "  --sssp-engine <engine>          delta-step (default) or bellman-ford.\n"
+      << "  --sssp-engine <engine>          bellman-ford (default) or delta-step.\n"
       << "  --delta <float|auto>            Delta-stepping bucket width. Default: 1\n"
       << "  --delta-multiplier <float>      Positive sweep multiplier for --delta auto. Default: 1\n"
       << "  --max-sssp-iters <int>          SSSP rounds; -1 for engine default.\n"

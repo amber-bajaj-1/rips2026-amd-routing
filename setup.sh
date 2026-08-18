@@ -409,8 +409,8 @@ main() {
     "Benchmarks: $BENCHMARK_DIR" \
     "Device graph: $DEVICE_GRAPH" \
     "Environment: $PROJECT_DIR/environment.sh" \
-    "Next: cd \"$PROJECT_DIR\" && make run BENCHMARK=logicnets_jscl" \
-    "Bellman-Ford: make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=bellman-ford"
+    "Next (Bellman-Ford): cd \"$PROJECT_DIR\" && make run BENCHMARK=logicnets_jscl" \
+    "Delta-Stepping: make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=delta-step"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

@@ -34,26 +34,26 @@ The four benchmark names are:
 
 ## Run one benchmark
 
-Delta-Stepping is the default engine:
+Bellman-Ford is the default engine:
 
 ```bash
 make run BENCHMARK=logicnets_jscl
 ```
 
-You can name the engine explicitly:
-
-```bash
-make run \
-  BENCHMARK=logicnets_jscl \
-  PATHFINDER_SSSP_ENGINE=delta-step
-```
-
-To use Bellman-Ford:
+You can name it explicitly:
 
 ```bash
 make run \
   BENCHMARK=logicnets_jscl \
   PATHFINDER_SSSP_ENGINE=bellman-ford
+```
+
+To use Delta-Stepping:
+
+```bash
+make run \
+  BENCHMARK=logicnets_jscl \
+  PATHFINDER_SSSP_ENGINE=delta-step
 ```
 
 The routed file is written to:
@@ -68,38 +68,39 @@ hidden by default.
 
 ## Run and time all four benchmarks
 
-Run all four with Delta-Stepping:
-
-```bash
-for BENCHMARK_NAME in logicnets_jscl boom_med_pb vtr_mcml rosetta_fd; do
-  /usr/bin/time -p make run \
-    BENCHMARK="$BENCHMARK_NAME" \
-    PATHFINDER_SSSP_ENGINE=delta-step \
-    OUTPUT_PHYS="benchmarks/${BENCHMARK_NAME}_delta-step_PathFinderFile.phys"
-done
-```
-
 Run all four with Bellman-Ford:
 
 ```bash
 for BENCHMARK_NAME in logicnets_jscl boom_med_pb vtr_mcml rosetta_fd; do
-  /usr/bin/time -p make run \
+  time -p make run \
     BENCHMARK="$BENCHMARK_NAME" \
     PATHFINDER_SSSP_ENGINE=bellman-ford \
     OUTPUT_PHYS="benchmarks/${BENCHMARK_NAME}_bellman-ford_PathFinderFile.phys"
 done
 ```
 
+Run all four with Delta-Stepping:
+
+```bash
+for BENCHMARK_NAME in logicnets_jscl boom_med_pb vtr_mcml rosetta_fd; do
+  time -p make run \
+    BENCHMARK="$BENCHMARK_NAME" \
+    PATHFINDER_SSSP_ENGINE=delta-step \
+    OUTPUT_PHYS="benchmarks/${BENCHMARK_NAME}_delta-step_PathFinderFile.phys"
+done
+```
+
 The explicit output names keep one engine's results from overwriting the
-other engine's results. `/usr/bin/time -p` reports the complete command time,
-while the program also reports the individual pipeline-stage times.
+other engine's results. Bash's built-in `time -p` reports the complete command
+time without requiring a separate timing program, while the router also reports
+the individual pipeline-stage times.
 
 ## Useful optional arguments
 
 `PATHFINDER_SSSP_ENGINE` accepts:
 
-- `delta-step` (default)
-- `bellman-ford`
+- `bellman-ford` (default)
+- `delta-step`
 
 Additional router options are passed with `PATHFINDER_ARGS`.
 
@@ -203,17 +204,16 @@ routing:
 ```bash
 make run \
   BENCHMARK=logicnets_jscl \
-  PATHFINDER_SSSP_ENGINE=delta-step \
   PATHFINDER_ARGS='--keep-work-dir'
 
 validation/validate_routes \
   --input benchmarks/logicnets_jscl_PathFinderFile.phys \
-  --engine delta-step \
+  --engine bellman-ford \
   --summary-json validation-summary.json
 ```
 
-Use the same engine name for routing and validation. For Bellman-Ford output,
-pass `--engine bellman-ford`.
+Use the same engine name for routing and validation. For Delta-Stepping output,
+pass `--engine delta-step`.
 
 To validate a route JSONL file directly, provide all three matching files from
 the same run:

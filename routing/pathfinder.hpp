@@ -132,7 +132,7 @@ struct RoutedNet {
 };
 
 struct PathfinderOptions {
-  SsspEngine sssp_engine = SsspEngine::kDeltaStep;
+  SsspEngine sssp_engine = SsspEngine::kBellmanFord;
   // Keep progress and component timings while hiding configuration details.
   bool concise_output = true;
   float delta = 1.0f;
