@@ -205,6 +205,9 @@ struct DistanceCheckOutput {
   std::size_t reported_distance_count = 0;
 };
 
+using ValidationProgressCallback =
+    void (*)(std::size_t completed, std::size_t total, void* user_data);
+
 struct ValidationCounts {
   std::size_t nets = 0;
   std::size_t sources = 0;
@@ -238,7 +241,9 @@ CheckResult check_shortest_path_optimality(
     const CsrGraph& graph,
     const RouteLoadResult& routes,
     const PathCheckOutput& paths,
-    const ValidationOptions& options);
+    const ValidationOptions& options,
+    ValidationProgressCallback progress_callback = nullptr,
+    void* progress_user_data = nullptr);
 
 CompletenessCheckOutput check_completeness(
     const Metadata& metadata,

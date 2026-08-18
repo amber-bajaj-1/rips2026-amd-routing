@@ -227,11 +227,13 @@ validation/validate_routes \
   --summary-json validation-summary.json
 ```
 
+Validation prints stage timings and periodic shortest-path progress by default.
 Useful validator options include:
 
+- `--no-progress` to suppress progress for scripted runs;
 - `--allow-unrouted` to permit explicitly incomplete routes;
 - `--optimality-scope router-bounds` to validate within the recorded routing
-  bounds; and
+  bounds, which is often much faster for large designs; and
 - `--max-diagnostics N` to limit printed diagnostics.
 
 Run `validation/validate_routes --help` for the full list.

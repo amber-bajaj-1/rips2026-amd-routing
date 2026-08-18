@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -34,6 +35,7 @@ struct CliOptions {
   std::filesystem::path work_dir;
   std::filesystem::path summary_json;
   bool engine_provided = false;
+  bool progress = true;
   ValidationOptions validation;
 };
 
@@ -62,6 +64,8 @@ void print_usage(const char* program, std::ostream& out) {
       << "  --expected-net-limit <n>        Validate only the metadata prefix.\n"
       << "  --max-diagnostics <n>           Printed/stored diagnostic cap "
          "(default 50).\n"
+      << "  --no-progress                   Suppress validation stages, timings, "
+         "and optimality progress.\n"
       << "  -h, --help                      Show this help.\n";
 }
 
@@ -171,6 +175,8 @@ CliOptions parse_args(int argc, char** argv) {
         throw UsageError("--max-diagnostics exceeds host size_t");
       }
       options.validation.max_diagnostics = static_cast<std::size_t>(value);
+    } else if (option == "--no-progress") {
+      options.progress = false;
     } else if (option == "-h" || option == "--help") {
       throw UsageError("--help must be used by itself");
     } else {
@@ -453,35 +459,142 @@ void print_diagnostics(const char* label, const CheckResult& result) {
   }
 }
 
+using ValidationClock = std::chrono::steady_clock;
+
+double elapsed_seconds(ValidationClock::time_point started) {
+  return std::chrono::duration<double>(ValidationClock::now() - started)
+      .count();
+}
+
+void print_stage_start(bool enabled, const std::string& label) {
+  if (!enabled) return;
+  std::cout << "[validation] " << label << "...\n" << std::flush;
+}
+
+void print_stage_complete(bool enabled,
+                          const std::string& label,
+                          ValidationClock::time_point started) {
+  if (!enabled) return;
+  std::ostringstream message;
+  message << std::fixed << std::setprecision(2) << "[validation] " << label
+          << " (" << elapsed_seconds(started) << " s)\n";
+  std::cout << message.str() << std::flush;
+}
+
+struct OptimalityProgressState {
+  bool enabled = false;
+  std::size_t next_percentage = 10;
+  ValidationClock::time_point started;
+};
+
+void print_optimality_progress(std::size_t completed,
+                               std::size_t total,
+                               void* user_data) {
+  auto* state = static_cast<OptimalityProgressState*>(user_data);
+  if (state == nullptr || !state->enabled || total == 0 || completed == 0 ||
+      completed >= total) {
+    return;
+  }
+  const std::size_t percentage = static_cast<std::size_t>(
+      static_cast<long double>(completed) * 100.0L /
+      static_cast<long double>(total));
+  if (percentage < state->next_percentage) return;
+
+  std::ostringstream message;
+  message << std::fixed << std::setprecision(2)
+          << "[validation] Shortest-path optimality: " << completed << '/'
+          << total << " nets (" << percentage << "%, "
+          << elapsed_seconds(state->started) << " s)\n";
+  std::cout << message.str() << std::flush;
+  state->next_percentage = (percentage / 10 + 1) * 10;
+}
+
 }  // namespace
 }  // namespace rips_validation
 
 int main(int argc, char** argv) {
   using namespace rips_validation;
   try {
+    const auto validation_started = ValidationClock::now();
     const CliOptions cli = parse_args(argc, argv);
+    auto stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Resolving validation artifacts");
     const ArtifactPaths artifacts = resolve_artifacts(cli);
+    print_stage_complete(cli.progress, "Validation artifacts resolved",
+                         stage_started);
 
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Loading and checking CSR graph");
     const CsrGraph graph = load_csr_v4(artifacts.csr);
+    print_stage_complete(cli.progress, "CSR graph loaded and checked",
+                         stage_started);
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Loading and checking routing metadata");
     const Metadata metadata = load_metadata_v8(artifacts.metadata);
+    print_stage_complete(cli.progress, "Routing metadata loaded and checked",
+                         stage_started);
     if (cli.validation.expected_net_limit.has_value() &&
         *cli.validation.expected_net_limit > metadata.route_requests.size()) {
       throw UsageError(
           "--expected-net-limit exceeds the metadata route-request count");
     }
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Loading routed-net records");
     const RouteLoadResult routes = load_route_jsonl(artifacts.routes);
+    print_stage_complete(
+        cli.progress,
+        "Routed-net records loaded (" +
+            std::to_string(routes.records.size()) + " nets)",
+        stage_started);
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Resolving referenced edge metadata");
     const ResolvedEdgeMetadataMap edge_metadata =
         load_referenced_edge_metadata(metadata, routes.records);
+    print_stage_complete(cli.progress, "Referenced edge metadata resolved",
+                         stage_started);
 
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress,
+                      "Checking path continuity and graph membership");
     const PathCheckOutput path_check =
         check_path_continuity_and_membership(
             graph, metadata, routes, edge_metadata, cli.validation);
+    print_stage_complete(
+        cli.progress,
+        "Path continuity and graph membership: " +
+            std::string(check_status_name(path_check.result.status)),
+        stage_started);
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Checking distance consistency");
     const DistanceCheckOutput distance_check = check_distance_consistency(
         graph, routes, path_check, cli.validation);
+    print_stage_complete(
+        cli.progress,
+        "Distance consistency: " +
+            std::string(check_status_name(distance_check.result.status)),
+        stage_started);
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Checking shortest-path optimality");
+    OptimalityProgressState optimality_progress{
+        cli.progress, 10, stage_started};
     const CheckResult optimality_check = check_shortest_path_optimality(
-        graph, routes, path_check, cli.validation);
+        graph, routes, path_check, cli.validation,
+        cli.progress ? &print_optimality_progress : nullptr,
+        &optimality_progress);
+    print_stage_complete(
+        cli.progress,
+        "Shortest-path optimality: " +
+            std::string(check_status_name(optimality_check.status)),
+        stage_started);
+    stage_started = ValidationClock::now();
+    print_stage_start(cli.progress, "Checking route completeness");
     const CompletenessCheckOutput completeness_check =
         check_completeness(metadata, routes, cli.validation);
+    print_stage_complete(
+        cli.progress,
+        "Route completeness: " +
+            std::string(check_status_name(completeness_check.result.status)),
+        stage_started);
 
     const std::size_t total_failures =
         path_check.result.failures + distance_check.result.failures +
@@ -539,10 +652,16 @@ int main(int argc, char** argv) {
     }
 
     if (!cli.summary_json.empty()) {
+      stage_started = ValidationClock::now();
+      print_stage_start(cli.progress, "Writing summary JSON");
       write_summary_json(cli.summary_json, artifacts, cli.validation,
                          path_check, distance_check, optimality_check,
                          completeness_check, total_failures, exit_code);
+      print_stage_complete(cli.progress, "Summary JSON written",
+                           stage_started);
     }
+    print_stage_complete(cli.progress, "Validation finished",
+                         validation_started);
     return exit_code;
   } catch (const UsageError& ex) {
     std::cerr << "usage error: " << ex.what() << '\n';

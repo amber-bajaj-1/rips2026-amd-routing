@@ -737,7 +737,9 @@ CheckResult check_shortest_path_optimality(
     const CsrGraph& graph,
     const RouteLoadResult& routes,
     const PathCheckOutput& paths,
-    const ValidationOptions& options) {
+    const ValidationOptions& options,
+    ValidationProgressCallback progress_callback,
+    void* progress_user_data) {
   CheckResult result;
   if (graph.rows > static_cast<std::uint64_t>(
                        std::numeric_limits<std::size_t>::max())) {
@@ -754,6 +756,10 @@ CheckResult check_shortest_path_optimality(
   using QueueEntry = std::pair<double, int>;
   for (std::size_t route_index = 0; route_index < routes.records.size();
        ++route_index) {
+    if (progress_callback != nullptr) {
+      progress_callback(route_index, routes.records.size(),
+                        progress_user_data);
+    }
     const RouteRecord& route = routes.records[route_index];
     if (++epoch == 0) {
       std::fill(distance_stamp.begin(), distance_stamp.end(), 0);
@@ -912,6 +918,10 @@ CheckResult check_shortest_path_optimality(
 
   if (result.status != CheckStatus::kFail && any_unobservable_unrouted) {
     result.mark_not_observable();
+  }
+  if (progress_callback != nullptr) {
+    progress_callback(routes.records.size(), routes.records.size(),
+                      progress_user_data);
   }
   return result;
 }

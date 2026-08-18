@@ -521,6 +521,31 @@ class ValidatorIntegrationTests(unittest.TestCase):
             self.assertIn("pass", rendered)
             self.assertIn("not_observable", rendered)
 
+    def test_default_progress_reports_major_validation_stages(self) -> None:
+        graph, request, record = simple_routed_case()
+        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
+            paths = materialize(Path(temporary), graph, [request], [record])
+            result = self.invoke(paths)
+            self.assert_success_summary(result)
+            self.assert_mentions(
+                result,
+                "validation artifacts resolved",
+                "csr graph loaded and checked",
+                "routing metadata loaded and checked",
+                "routed net records loaded",
+                "path continuity and graph membership",
+                "shortest path optimality",
+                "validation finished",
+            )
+
+    def test_progress_can_be_suppressed_for_scripted_runs(self) -> None:
+        graph, request, record = simple_routed_case()
+        with tempfile.TemporaryDirectory(prefix="rips-validation-") as temporary:
+            paths = materialize(Path(temporary), graph, [request], [record])
+            result = self.invoke(paths, "--no-progress")
+            self.assert_success_summary(result)
+            self.assertNotIn("[validation]", result.stdout)
+
     def test_source_equals_sink(self) -> None:
         graph = Graph([[]])
         request = Request(
