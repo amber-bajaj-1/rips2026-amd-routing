@@ -82,6 +82,7 @@ struct Options {
   std::filesystem::path output_path;
   Bounds bounds;
   NodeBoundsMode node_bounds_mode = NodeBoundsMode::kPocBaseWire;
+  bool verbose_output = false;
 };
 
 int parse_int_arg(const char* text, const char* name) {
@@ -110,7 +111,8 @@ void print_usage(const char* program) {
       << "  --node-bounds-mode <mode>      poc-base-wire, fully-contained, "
          "or intersects.\n"
       << "  --full-device                  Import every tile with XY coords "
-         "(default).\n";
+         "(default).\n"
+      << "  --verbose                      Show device-graph statistics.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -142,6 +144,10 @@ Options parse_options(int argc, char** argv) {
     }
     if (arg == "--full-device") {
       options.bounds = Bounds{};
+      continue;
+    }
+    if (arg == "--verbose") {
+      options.verbose_output = true;
       continue;
     }
     if (!arg.empty() && arg.front() == '-') {
@@ -1393,12 +1399,14 @@ int main(int argc, char** argv) {
     const Options options = parse_options(argc, argv);
     require_distinct_interchange_paths(
         {options.device_path, options.output_path});
-    std::cout << "device: " << options.device_path << '\n'
-              << "bounds: X" << options.bounds.min_x << "..X"
-              << options.bounds.max_x << ", Y" << options.bounds.min_y
-              << "..Y" << options.bounds.max_y << '\n'
-              << "node_bounds_mode: "
-              << node_bounds_mode_name(options.node_bounds_mode) << '\n';
+    if (options.verbose_output) {
+      std::cout << "device: " << options.device_path << '\n'
+                << "bounds: X" << options.bounds.min_x << "..X"
+                << options.bounds.max_x << ", Y" << options.bounds.min_y
+                << "..Y" << options.bounds.max_y << '\n'
+                << "node_bounds_mode: "
+                << node_bounds_mode_name(options.node_bounds_mode) << '\n';
+    }
 
     BuildResult result = build_device_routing_graph(options);
     write_graph_atomically(result.graph, result.entries, options.output_path);
@@ -1408,17 +1416,19 @@ int main(int argc, char** argv) {
     const std::uint64_t compact_bytes =
         (node_count + 1) * sizeof(std::int64_t) +
         edge_count * (sizeof(std::int32_t) + sizeof(EdgeAttr));
-    std::cout << "device_fingerprint: " << result.graph.device_fingerprint
-              << '\n'
-              << "imported_nodes: " << node_count << '\n'
-              << "declared_edges: " << result.graph.declared_edges << '\n'
-              << "unique_edges: " << edge_count << '\n'
-              << "typed_site_pin_aliases: "
-              << result.graph.site_pin_nodes.size() << '\n'
-              << "endpoint_attachments: "
-              << result.graph.endpoint_attachments.size() << '\n'
-              << "base_csr_and_attrs_mib: " << mib(compact_bytes) << '\n'
-              << "wrote_device_graph: " << options.output_path << '\n';
+    if (options.verbose_output) {
+      std::cout << "device_fingerprint: " << result.graph.device_fingerprint
+                << '\n'
+                << "imported_nodes: " << node_count << '\n'
+                << "declared_edges: " << result.graph.declared_edges << '\n'
+                << "unique_edges: " << edge_count << '\n'
+                << "typed_site_pin_aliases: "
+                << result.graph.site_pin_nodes.size() << '\n'
+                << "endpoint_attachments: "
+                << result.graph.endpoint_attachments.size() << '\n'
+                << "base_csr_and_attrs_mib: " << mib(compact_bytes) << '\n'
+                << "wrote_device_graph: " << options.output_path << '\n';
+    }
     return 0;
   } catch (const std::exception& error) {
     if (argc < 2) {

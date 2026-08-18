@@ -14,6 +14,34 @@ def source(relative: str) -> str:
 
 
 class ArtifactContractSourceTest(unittest.TestCase):
+    def test_conversion_diagnostics_are_opt_in(self) -> None:
+        converter = source("pre-process/interchange_to_csr.cpp")
+        device_builder = source("pre-process/device_to_routing_graph.cpp")
+        wrapper = source("routing/pathfinder_router.cpp")
+
+        for name, text in (
+            ("interchange converter", converter),
+            ("device-graph builder", device_builder),
+        ):
+            with self.subTest(name=name):
+                self.assertIn("bool verbose_output = false;", text)
+                self.assertIn('arg == "--verbose"', text)
+                self.assertIn("options.verbose_output = true;", text)
+
+        telemetry_first_arguments = re.findall(
+            r"emit_stage_telemetry\(\s*([^,\n]+)", converter
+        )
+        self.assertGreater(len(telemetry_first_arguments), 1)
+        self.assertEqual(telemetry_first_arguments[0], "bool enabled")
+        self.assertTrue(
+            all(
+                argument == "options.verbose_output"
+                for argument in telemetry_first_arguments[1:]
+            )
+        )
+        self.assertIn("if (!enabled)", converter)
+        self.assertIn('convert_cmd.push_back("--verbose")', wrapper)
+
     def test_converter_writes_csr_v4_without_weight_or_shard_payloads(self) -> None:
         text = source("pre-process/interchange_to_csr.cpp")
         self.assertRegex(

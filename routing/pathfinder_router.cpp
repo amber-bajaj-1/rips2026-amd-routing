@@ -504,6 +504,9 @@ int main(int argc, char** argv) {
         "--metadata",
         metadata_path.string(),
     };
+    if (options.verbose_output) {
+      convert_cmd.push_back("--verbose");
+    }
     run_command(convert_cmd, "convert FPGAIF to CSR", options.verbose_output,
                 work_dir / "interchange_to_csr.log");
     print_progress(1, 3, "CSR conversion complete");

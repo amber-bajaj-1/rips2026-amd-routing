@@ -483,6 +483,7 @@ struct Options {
   std::filesystem::path output_path;
   std::filesystem::path metadata_path;
   bool allow_unsupported_preserved_nets = false;
+  bool verbose_output = false;
 };
 
 void print_usage(const char* program) {
@@ -493,6 +494,7 @@ void print_usage(const char* program) {
          "<output.csrbin> [options]\n\n"
       << "Options:\n"
       << "  --metadata <path>              Sidecar FPGA metadata output.\n\n"
+      << "  --verbose                      Show conversion diagnostics.\n\n"
       << "  --allow-unsupported-preserved-nets\n"
       << "                                 Keep unsupported partial/static "
          "work unchanged.\n\n"
@@ -524,6 +526,11 @@ Options parse_options(int argc, char** argv) {
 
     if (arg == "--allow-unsupported-preserved-nets") {
       options.allow_unsupported_preserved_nets = true;
+      continue;
+    }
+
+    if (arg == "--verbose") {
+      options.verbose_output = true;
       continue;
     }
 
@@ -745,9 +752,13 @@ std::uint64_t process_peak_rss_bytes() {
 }
 
 void emit_stage_telemetry(
+    bool enabled,
     const char* stage,
     double seconds,
     std::initializer_list<std::pair<const char*, std::uint64_t>> fields = {}) {
+  if (!enabled) {
+    return;
+  }
   std::cout << std::setprecision(9)
             << "{\"type\":\"interchange_to_csr_stage\","
                "\"schema_version\":1,\"stage\":\""
@@ -1447,7 +1458,8 @@ void parse_logical_netlist(const std::filesystem::path& logical_path,
 PhysicalImportStats parse_physical_netlist(
     const std::filesystem::path& phys_path,
     RoutingGraph& graph,
-    DecodeParseTelemetry* telemetry) {
+    DecodeParseTelemetry* telemetry,
+    bool verbose_output) {
   using PhysNetlist = PhysicalNetlist::PhysNetlist;
 
   DecodeParseTelemetryRecorder telemetry_recorder(telemetry);
@@ -1628,26 +1640,34 @@ PhysicalImportStats parse_physical_netlist(
         case routing::interchange::PhysicalNetDisposition::
             kExcludeDriverlessSignal:
           ++stats.excluded_driverless_nets;
-          std::cout << "excluded_driverless_net: " << physical_net_name
-                    << '\n';
+          if (verbose_output) {
+            std::cout << "excluded_driverless_net: " << physical_net_name
+                      << '\n';
+          }
           break;
         case routing::interchange::PhysicalNetDisposition::
             kPreserveUnsupportedPartialSignal:
           ++stats.unsupported_partial_signal_nets;
-          std::cout << "preserved_unsupported_partial_signal_net: "
-                    << physical_net_name << '\n';
+          if (verbose_output) {
+            std::cout << "preserved_unsupported_partial_signal_net: "
+                      << physical_net_name << '\n';
+          }
           break;
         case routing::interchange::PhysicalNetDisposition::
             kPreserveUnsupportedSignalShape:
           ++stats.unsupported_signal_shape_nets;
-          std::cout << "preserved_unsupported_signal_shape_net: "
-                    << physical_net_name << '\n';
+          if (verbose_output) {
+            std::cout << "preserved_unsupported_signal_shape_net: "
+                      << physical_net_name << '\n';
+          }
           break;
         case routing::interchange::PhysicalNetDisposition::
             kPreserveUnsupportedStatic:
           ++stats.unsupported_static_nets;
-          std::cout << "preserved_unsupported_static_net: "
-                    << physical_net_name << '\n';
+          if (verbose_output) {
+            std::cout << "preserved_unsupported_static_net: "
+                      << physical_net_name << '\n';
+          }
           break;
         case routing::interchange::PhysicalNetDisposition::kRouteSignal:
           break;
@@ -2428,9 +2448,11 @@ int main(int argc, char** argv) {
       }
     }
 
-    std::cout << "device_graph: " << options.device_graph_path << "\n";
-    std::cout << "physical_netlist: " << options.phys_path << "\n";
-    std::cout << "logical_netlist: " << options.logical_path << "\n";
+    if (options.verbose_output) {
+      std::cout << "device_graph: " << options.device_graph_path << "\n";
+      std::cout << "physical_netlist: " << options.phys_path << "\n";
+      std::cout << "logical_netlist: " << options.logical_path << "\n";
+    }
     DeviceRoutingGraphReadTelemetry devicegraph_telemetry;
     RoutingGraph graph(read_device_routing_graph_for_routing(
         options.device_graph_path, true, &devicegraph_telemetry));
@@ -2438,6 +2460,7 @@ int main(int argc, char** argv) {
         vector_allocation_bytes(graph.string_table.strings,
                                 "devicegraph string objects");
     emit_stage_telemetry(
+        options.verbose_output,
         "devicegraph_strings",
         devicegraph_telemetry.string_loading_seconds +
             devicegraph_telemetry.string_index_seconds,
@@ -2448,17 +2471,20 @@ int main(int argc, char** argv) {
          {"index_entries",
           static_cast<std::uint64_t>(graph.string_table.ids.size())}});
     emit_stage_telemetry(
+        options.verbose_output,
         "devicegraph_bulk_arrays",
         devicegraph_telemetry.bulk_array_loading_seconds,
         {{"file_bytes", devicegraph_telemetry.bulk_file_bytes},
          {"allocation_bytes",
           routing_projection_bulk_allocation_bytes(graph)}});
-    std::cout << "device_fingerprint: " << graph.device_fingerprint << "\n";
-    std::cout << "bounds: X" << graph.bounds.min_x << "..X"
-              << graph.bounds.max_x << ", Y" << graph.bounds.min_y << "..Y"
-              << graph.bounds.max_y << "\n";
-    std::cout << "node_bounds_mode: "
-              << node_bounds_mode_name(graph.node_bounds_mode) << "\n";
+    if (options.verbose_output) {
+      std::cout << "device_fingerprint: " << graph.device_fingerprint << "\n";
+      std::cout << "bounds: X" << graph.bounds.min_x << "..X"
+                << graph.bounds.max_x << ", Y" << graph.bounds.min_y << "..Y"
+                << graph.bounds.max_y << "\n";
+      std::cout << "node_bounds_mode: "
+                << node_bounds_mode_name(graph.node_bounds_mode) << "\n";
+    }
 
     // Static string IDs are loaded first and remain stable. Benchmark-specific
     // provenance and net names are appended to that namespace.
@@ -2467,20 +2493,24 @@ int main(int argc, char** argv) {
     graph.logical_path_string =
         graph.string_table.intern(options.logical_path.string());
 
-    std::cout << "imported_nodes: "
-              << device_routing_graph_node_count(graph) << "\n";
-    std::cout << "unique_edges: " << graph.loaded_edges << "\n";
+    if (options.verbose_output) {
+      std::cout << "imported_nodes: "
+                << device_routing_graph_node_count(graph) << "\n";
+      std::cout << "unique_edges: " << graph.loaded_edges << "\n";
+    }
 
     // LogicalNetlist parsing records logical cells/nets/port instances and
     // builds a name index that physical route requests can reference.
     DecodeParseTelemetry logical_telemetry;
     parse_logical_netlist(options.logical_path, graph, &logical_telemetry);
     emit_stage_telemetry(
+        options.verbose_output,
         "logical_decode", logical_telemetry.decode_seconds,
         {{"decoded_bytes", logical_telemetry.decoded_bytes},
          {"allocation_bytes",
           logical_telemetry.decode_peak_allocation_bytes}});
     emit_stage_telemetry(
+        options.verbose_output,
         "logical_parse", logical_telemetry.parse_seconds,
         {{"logical_nets", static_cast<std::uint64_t>(
                               graph.logical_net_name_strings.size())}});
@@ -2491,13 +2521,16 @@ int main(int argc, char** argv) {
     DecodeParseTelemetry physical_telemetry;
     const PhysicalImportStats import_stats =
         parse_physical_netlist(options.phys_path, graph,
-                               &physical_telemetry);
+                               &physical_telemetry,
+                               options.verbose_output);
     emit_stage_telemetry(
+        options.verbose_output,
         "physical_decode", physical_telemetry.decode_seconds,
         {{"decoded_bytes", physical_telemetry.decoded_bytes},
          {"allocation_bytes",
           physical_telemetry.decode_peak_allocation_bytes}});
     emit_stage_telemetry(
+        options.verbose_output,
         "physical_parse", physical_telemetry.parse_seconds,
         {{"route_requests",
           static_cast<std::uint64_t>(import_stats.route_requests)},
@@ -2506,22 +2539,24 @@ int main(int argc, char** argv) {
               graph.enabled_endpoint_attachments.begin(),
               graph.enabled_endpoint_attachments.end(),
               static_cast<std::uint8_t>(1)))}});
-    std::cout << "route_requests: " << import_stats.route_requests << "\n";
-    std::cout << "excluded_driverless_nets: "
-              << import_stats.excluded_driverless_nets << "\n";
-    std::cout << "preserved_nets: " << import_stats.preserved_nets << "\n";
-    std::cout << "preserved_unsupported_partial_signal_nets: "
-              << import_stats.unsupported_partial_signal_nets << "\n";
-    std::cout << "preserved_unsupported_signal_shape_nets: "
-              << import_stats.unsupported_signal_shape_nets << "\n";
-    std::cout << "preserved_unsupported_static_nets: "
-              << import_stats.unsupported_static_nets << "\n";
-    std::cout << "unresolved_route_endpoints: "
-              << import_stats.unresolved_endpoints << "\n";
-    std::cout << "unresolved_fixed_resources: "
-              << import_stats.unresolved_fixed_resources << "\n";
-    std::cout << "conservative_fixed_site_pin_fallbacks: "
-              << import_stats.conservative_fixed_site_pin_fallbacks << "\n";
+    if (options.verbose_output) {
+      std::cout << "route_requests: " << import_stats.route_requests << "\n";
+      std::cout << "excluded_driverless_nets: "
+                << import_stats.excluded_driverless_nets << "\n";
+      std::cout << "preserved_nets: " << import_stats.preserved_nets << "\n";
+      std::cout << "preserved_unsupported_partial_signal_nets: "
+                << import_stats.unsupported_partial_signal_nets << "\n";
+      std::cout << "preserved_unsupported_signal_shape_nets: "
+                << import_stats.unsupported_signal_shape_nets << "\n";
+      std::cout << "preserved_unsupported_static_nets: "
+                << import_stats.unsupported_static_nets << "\n";
+      std::cout << "unresolved_route_endpoints: "
+                << import_stats.unresolved_endpoints << "\n";
+      std::cout << "unresolved_fixed_resources: "
+                << import_stats.unresolved_fixed_resources << "\n";
+      std::cout << "conservative_fixed_site_pin_fallbacks: "
+                << import_stats.conservative_fixed_site_pin_fallbacks << "\n";
+    }
 
     const std::size_t unsupported_net_count =
         import_stats.unsupported_partial_signal_nets +
@@ -2550,12 +2585,14 @@ int main(int argc, char** argv) {
     CsrBuildTelemetry csr_build_telemetry;
     CsrGraph csr = make_outgoing_csr(graph, &csr_build_telemetry);
     emit_stage_telemetry(
+        options.verbose_output,
         "graph_filtering", csr_build_telemetry.filtering_seconds,
         {{"base_edges", graph.loaded_edges},
          {"retained_edges", static_cast<std::uint64_t>(csr.colind.size())},
          {"allocation_bytes",
           csr_build_telemetry.filtering_output_allocation_bytes}});
     emit_stage_telemetry(
+        options.verbose_output,
         "endpoint_pip_binding",
         csr_build_telemetry.endpoint_binding_seconds,
         {{"endpoint_pips",
@@ -2563,6 +2600,7 @@ int main(int argc, char** argv) {
          {"allocation_bytes",
           csr_build_telemetry.endpoint_binding_allocation_bytes}});
     emit_stage_telemetry(
+        options.verbose_output,
         "spatial_sidecar", csr_build_telemetry.spatial_sidecar_seconds,
         {{"spatial_offset_count",
           static_cast<std::uint64_t>(
@@ -2572,8 +2610,10 @@ int main(int argc, char** argv) {
               csr.routing_sidecars.spatial_edges.edge_ids.size())},
          {"allocation_bytes",
           csr_build_telemetry.spatial_sidecar_allocation_bytes}});
-    std::cout << "enabled_endpoint_pips: " << graph.endpoint_pips.size()
-              << "\n";
+    if (options.verbose_output) {
+      std::cout << "enabled_endpoint_pips: " << graph.endpoint_pips.size()
+                << "\n";
+    }
 
     // Metadata v8 does not serialize the seven physical node-metadata arrays.
     // The filtering reader normally projected them out before this point;
@@ -2656,6 +2696,7 @@ int main(int argc, char** argv) {
       csr_output_bytes =
           checked_file_size(staged_csr_path, "staged CSR");
       emit_stage_telemetry(
+          options.verbose_output,
           "csr_writing", elapsed_seconds(csr_write_begin, csr_write_end),
           {{"output_bytes", csr_output_bytes},
            {"row_count", static_cast<std::uint64_t>(csr.rows)},
@@ -2679,6 +2720,7 @@ int main(int argc, char** argv) {
       metadata_output_bytes =
           checked_file_size(staged_metadata_path, "staged metadata");
       emit_stage_telemetry(
+          options.verbose_output,
           "metadata_packing_writing",
           elapsed_seconds(metadata_write_begin, metadata_write_end),
           {{"output_bytes", metadata_output_bytes},
@@ -2806,12 +2848,14 @@ int main(int argc, char** argv) {
     }
     const auto publication_end = TelemetryClock::now();
     emit_stage_telemetry(
+        options.verbose_output,
         "publication", elapsed_seconds(publication_begin, publication_end),
         {{"csr_bytes", csr_output_bytes},
          {"metadata_bytes", metadata_output_bytes},
          {"generation_bytes", generation_output_bytes},
          {"output_bytes", output_bytes}});
     emit_stage_telemetry(
+        options.verbose_output,
         "total", elapsed_seconds(total_begin, TelemetryClock::now()),
         {{"nodes", static_cast<std::uint64_t>(csr_rows)},
          {"base_edges", graph.loaded_edges},
@@ -2819,17 +2863,19 @@ int main(int argc, char** argv) {
          {"pip_count", static_cast<std::uint64_t>(graph.pip_data.size())},
          {"output_bytes", output_bytes}});
 
-    std::cout << "csr_rows: " << csr_rows << "\n";
-    std::cout << "csr_nnz: " << csr_nnz << "\n";
-    std::cout << "csr_total_mib: " << mib(csr_output_bytes) << "\n";
-    std::cout << "csr_payload_mib: " << mib(csr_bytes) << "\n";
-    std::cout << "csr_rowptr_mib: " << mib(rowptr_bytes) << "\n";
-    std::cout << "csr_colind_mib: " << mib(colind_bytes) << "\n";
-    std::cout << "csr_values_mib: " << mib(values_bytes) << "\n";
-    std::cout << "metadata_edge_attr_mib: " << mib(attr_bytes) << "\n";
+    if (options.verbose_output) {
+      std::cout << "csr_rows: " << csr_rows << "\n";
+      std::cout << "csr_nnz: " << csr_nnz << "\n";
+      std::cout << "csr_total_mib: " << mib(csr_output_bytes) << "\n";
+      std::cout << "csr_payload_mib: " << mib(csr_bytes) << "\n";
+      std::cout << "csr_rowptr_mib: " << mib(rowptr_bytes) << "\n";
+      std::cout << "csr_colind_mib: " << mib(colind_bytes) << "\n";
+      std::cout << "csr_values_mib: " << mib(values_bytes) << "\n";
+      std::cout << "metadata_edge_attr_mib: " << mib(attr_bytes) << "\n";
 
-    std::cout << "wrote_csr: " << options.output_path << "\n";
-    std::cout << "wrote_metadata: " << options.metadata_path << "\n";
+      std::cout << "wrote_csr: " << options.output_path << "\n";
+      std::cout << "wrote_metadata: " << options.metadata_path << "\n";
+    }
 
   } catch (const std::exception& ex) {
     if (argc < 2) {
