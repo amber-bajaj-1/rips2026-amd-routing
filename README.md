@@ -2,6 +2,8 @@
 
 This repository was created as part of UCLA's Institute for Pure and Applied Mathematics (IPAM) Research in Industrial Projects for Students (RIPS) program for Advanced Micro Devices (AMD). The project centered around implementing Bellman-Ford and Delta-Stepping as routing algorithms on AMD client GPUs, with the goal of speeding up FPGA routing. 
 
+Documentation on how to run and validate the program files are below. The 4 benchmarks included in this repository come from RapidWright's 2024 Runtime-First FPGA Interchange Routing Contest. 
+
 ## Set up
 
 Run the setup script on an AMD University Program image with ROCm installed:
@@ -15,8 +17,7 @@ cd "$HOME_DIRECTORY/rips2026-amd-routing"
 ```
 
 The setup script downloads the benchmark package and required schemas, builds
-the programs, and creates the reusable device graph. It can be rerun safely if
-setup was interrupted.
+the programs, and creates the reusable device graph.
 
 The four benchmark names are:
 
