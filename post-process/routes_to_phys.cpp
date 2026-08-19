@@ -92,14 +92,17 @@ struct RouteEdge {
   int from = -1;
   int to = -1;
   std::uint64_t csr_edge = 0;
-  std::string tile;
-  std::string wire0;
-  std::string wire1;
+  // Intern route strings directly into the output PhysicalNetlist string
+  // table.  A route can contain millions of edges and these four owned
+  // strings previously dominated its live reconstruction footprint.
+  std::uint32_t tile = kNoPhysicalString;
+  std::uint32_t wire0 = kNoPhysicalString;
+  std::uint32_t wire1 = kNoPhysicalString;
   bool forward = true;
   bool attachment_field_present = false;
   std::optional<std::uint64_t> attachment;
   bool site_field_present = false;
-  std::optional<std::string> site;
+  std::uint32_t site = kNoPhysicalString;
 };
 
 struct RouteQueryBounds {
@@ -191,6 +194,13 @@ struct MetadataRouteEdge {
   bool forward = true;
 };
 
+struct RouteIndexHeader {
+  std::optional<routing::interchange::InterchangeArtifactPairId>
+      artifact_pair_id;
+  std::string net;
+  bool routed = false;
+};
+
 struct JsonNumber {
   std::string_view text;
 };
@@ -235,6 +245,63 @@ class JsonParser {
       throw std::runtime_error("trailing characters after JSON value");
     }
     return value;
+  }
+
+  // The indexing pass needs only identity and strict-routing state.  Scan and
+  // validate the rest of the JSON without building its sources, sinks, edge
+  // vectors, strings, or a general-purpose DOM; the complete line is parsed
+  // once later when its PhysicalNetlist net is reconstructed.
+  RouteIndexHeader parse_route_index_header() {
+    if (!consume('{')) throw std::runtime_error("expected JSON object");
+    RouteIndexHeader header;
+    bool have_artifact_pair_id = false;
+    bool have_net = false;
+    bool have_routed = false;
+    if (!consume('}')) {
+      while (true) {
+        std::string key = parse_string();
+        if (!consume(':')) {
+          throw std::runtime_error("expected ':' in JSON object");
+        }
+        if (key == "artifact_pair_id") {
+          if (have_artifact_pair_id) {
+            throw std::runtime_error("duplicate key in JSON object");
+          }
+          have_artifact_pair_id = true;
+          header.artifact_pair_id =
+              routing::interchange::parse_interchange_artifact_pair_id(
+                  parse_string());
+        } else if (key == "net") {
+          if (have_net) {
+            throw std::runtime_error("duplicate key in JSON object");
+          }
+          have_net = true;
+          header.net = parse_string();
+        } else if (key == "routed") {
+          if (have_routed) {
+            throw std::runtime_error("duplicate key in JSON object");
+          }
+          have_routed = true;
+          header.routed = parse_bool_value("routed");
+        } else {
+          skip_value();
+        }
+        if (consume('}')) break;
+        if (!consume(',')) {
+          throw std::runtime_error("expected ',' in JSON object");
+        }
+      }
+    }
+    skip_ws();
+    if (pos_ != text_.size()) {
+      throw std::runtime_error("trailing characters after JSON value");
+    }
+    if (!have_artifact_pair_id) {
+      throw std::runtime_error("missing JSON key: artifact_pair_id");
+    }
+    if (!have_net) throw std::runtime_error("missing JSON key: net");
+    if (!have_routed) throw std::runtime_error("missing JSON key: routed");
+    return header;
   }
 
  private:
@@ -321,6 +388,118 @@ class JsonParser {
     }
     if (ch == '-' || std::isdigit(static_cast<unsigned char>(ch))) {
       return JsonValue{parse_number()};
+    }
+    throw std::runtime_error("unexpected JSON value");
+  }
+
+  bool parse_bool_value(const char* name) {
+    const char ch = peek();
+    if (ch == 't') {
+      expect_literal("true");
+      return true;
+    }
+    if (ch == 'f') {
+      expect_literal("false");
+      return false;
+    }
+    throw std::runtime_error(std::string("JSON field is not bool: ") + name);
+  }
+
+  void skip_string() {
+    if (!consume('"')) throw std::runtime_error("expected JSON string");
+    while (pos_ < text_.size()) {
+      const char ch = text_[pos_++];
+      if (ch == '"') return;
+      if (ch != '\\') {
+        if (static_cast<unsigned char>(ch) < 0x20) {
+          throw std::runtime_error("unescaped control byte in JSON string");
+        }
+        continue;
+      }
+      if (pos_ >= text_.size()) throw std::runtime_error("bad JSON escape");
+      const char escaped = text_[pos_++];
+      switch (escaped) {
+        case '"':
+        case '\\':
+        case '/':
+        case 'b':
+        case 'f':
+        case 'n':
+        case 'r':
+        case 't':
+          break;
+        case 'u': {
+          const unsigned code = parse_hex_code_unit();
+          if (code >= 0xd800 && code <= 0xdbff) {
+            if (pos_ + 2 > text_.size() || text_[pos_] != '\\' ||
+                text_[pos_ + 1] != 'u') {
+              throw std::runtime_error(
+                  "JSON high surrogate lacks a low surrogate");
+            }
+            pos_ += 2;
+            const unsigned low = parse_hex_code_unit();
+            if (low < 0xdc00 || low > 0xdfff) {
+              throw std::runtime_error("invalid JSON low surrogate");
+            }
+          } else if (code >= 0xdc00 && code <= 0xdfff) {
+            throw std::runtime_error("lone JSON low surrogate");
+          }
+          break;
+        }
+        default:
+          throw std::runtime_error("bad JSON escape");
+      }
+    }
+    throw std::runtime_error("unterminated JSON string");
+  }
+
+  void skip_value() {
+    const char ch = peek();
+    if (ch == '{') {
+      (void)consume('{');
+      if (consume('}')) return;
+      while (true) {
+        skip_string();
+        if (!consume(':')) {
+          throw std::runtime_error("expected ':' in JSON object");
+        }
+        skip_value();
+        if (consume('}')) return;
+        if (!consume(',')) {
+          throw std::runtime_error("expected ',' in JSON object");
+        }
+      }
+    }
+    if (ch == '[') {
+      (void)consume('[');
+      if (consume(']')) return;
+      while (true) {
+        skip_value();
+        if (consume(']')) return;
+        if (!consume(',')) {
+          throw std::runtime_error("expected ',' in JSON array");
+        }
+      }
+    }
+    if (ch == '"') {
+      skip_string();
+      return;
+    }
+    if (ch == 't') {
+      expect_literal("true");
+      return;
+    }
+    if (ch == 'f') {
+      expect_literal("false");
+      return;
+    }
+    if (ch == 'n') {
+      expect_literal("null");
+      return;
+    }
+    if (ch == '-' || std::isdigit(static_cast<unsigned char>(ch))) {
+      (void)parse_number();
+      return;
     }
     throw std::runtime_error("unexpected JSON value");
   }
@@ -1209,7 +1388,15 @@ void validate_route_summary(const NetRoute& route) {
   }
 }
 
-NetRoute parse_route_line_dom(const std::string& line) {
+std::uint32_t string_index(
+    std::string text,
+    std::vector<std::string>& strings,
+    std::unordered_map<std::string, std::uint32_t>& string_to_index);
+
+NetRoute parse_route_line_dom(
+    const std::string& line,
+    std::vector<std::string>& strings,
+    std::unordered_map<std::string, std::uint32_t>& string_to_index) {
   const JsonValue root = JsonParser(line).parse();
   const auto& object = root.as_object("route");
   NetRoute route;
@@ -1251,14 +1438,20 @@ NetRoute parse_route_line_dom(const std::string& line) {
     edge.from = json_int(edge_object, "from");
     edge.to = json_int(edge_object, "to");
     edge.csr_edge = json_u64(edge_object, "csr_edge");
-    edge.tile = json_string(edge_object, "tile");
-    edge.wire0 = json_string(edge_object, "wire0");
-    edge.wire1 = json_string(edge_object, "wire1");
+    edge.tile = string_index(json_string(edge_object, "tile"), strings,
+                             string_to_index);
+    edge.wire0 = string_index(json_string(edge_object, "wire0"), strings,
+                              string_to_index);
+    edge.wire1 = string_index(json_string(edge_object, "wire1"), strings,
+                              string_to_index);
     edge.forward = json_bool(edge_object, "forward");
     edge.attachment = nullable_json_u64(
         edge_object, "attachment", &edge.attachment_field_present);
-    edge.site =
+    const std::optional<std::string> site =
         nullable_json_string(edge_object, "site", &edge.site_field_present);
+    if (site.has_value()) {
+      edge.site = string_index(*site, strings, string_to_index);
+    }
     route.edges.push_back(std::move(edge));
   }
 
@@ -1278,7 +1471,13 @@ class CanonicalRouteLayoutMismatch final : public std::runtime_error {
 // general parser below.
 class CanonicalRouteParser {
  public:
-  explicit CanonicalRouteParser(const std::string& text) : text_(text) {}
+  CanonicalRouteParser(
+      const std::string& text,
+      std::vector<std::string>& strings,
+      std::unordered_map<std::string, std::uint32_t>& string_to_index)
+      : text_(text),
+        strings_(strings),
+        string_to_index_(string_to_index) {}
 
   NetRoute parse() {
     NetRoute route;
@@ -1644,13 +1843,16 @@ class CanonicalRouteParser {
     edge.csr_edge = parse_integer<std::uint64_t>("csr_edge");
     expect(',');
     expect_key("tile");
-    edge.tile = parse_string("tile");
+    edge.tile = string_index(parse_string("tile"), strings_,
+                             string_to_index_);
     expect(',');
     expect_key("wire0");
-    edge.wire0 = parse_string("wire0");
+    edge.wire0 = string_index(parse_string("wire0"), strings_,
+                              string_to_index_);
     expect(',');
     expect_key("wire1");
-    edge.wire1 = parse_string("wire1");
+    edge.wire1 = string_index(parse_string("wire1"), strings_,
+                              string_to_index_);
     expect(',');
     expect_key("forward");
     edge.forward = parse_bool("forward");
@@ -1661,7 +1863,10 @@ class CanonicalRouteParser {
     expect(',');
     expect_key("site");
     edge.site_field_present = true;
-    edge.site = parse_nullable_string("site");
+    const std::optional<std::string> site = parse_nullable_string("site");
+    if (site.has_value()) {
+      edge.site = string_index(*site, strings_, string_to_index_);
+    }
     expect('}');
     return edge;
   }
@@ -1677,26 +1882,41 @@ class CanonicalRouteParser {
   }
 
   const std::string& text_;
+  std::vector<std::string>& strings_;
+  std::unordered_map<std::string, std::uint32_t>& string_to_index_;
   std::size_t pos_ = 0;
 };
 
-NetRoute parse_route_line(const std::string& line) {
+NetRoute parse_route_line(
+    const std::string& line,
+    std::vector<std::string>& strings,
+    std::unordered_map<std::string, std::uint32_t>& string_to_index) {
+  const std::size_t original_string_count = strings.size();
   try {
-    return CanonicalRouteParser(line).parse();
+    return CanonicalRouteParser(line, strings, string_to_index).parse();
   } catch (const CanonicalRouteLayoutMismatch&) {
-    return parse_route_line_dom(line);
+    // A late layout mismatch can occur after the fast parser has interned
+    // some edge strings.  Roll those additions back before the general
+    // parser retries so parsing remains transactional.
+    while (strings.size() > original_string_count) {
+      string_to_index.erase(strings.back());
+      strings.pop_back();
+    }
+    return parse_route_line_dom(line, strings, string_to_index);
   }
 }
 
 using RouteRequestsByNet =
-    std::unordered_map<std::string, const MetadataRouteRequest*>;
+    std::unordered_map<std::string_view, std::size_t>;
 
 RouteRequestsByNet build_route_requests_by_net(
     const RoutingMetadataSummary& metadata) {
   RouteRequestsByNet requests_by_net;
   requests_by_net.reserve(metadata.route_requests.size());
-  for (const MetadataRouteRequest& request : metadata.route_requests) {
-    if (!requests_by_net.emplace(request.net, &request).second) {
+  for (std::size_t index = 0; index < metadata.route_requests.size();
+       ++index) {
+    const MetadataRouteRequest& request = metadata.route_requests[index];
+    if (!requests_by_net.emplace(std::string_view(request.net), index).second) {
       throw std::runtime_error(
           "metadata contains duplicate route request: " + request.net);
     }
@@ -1707,9 +1927,21 @@ RouteRequestsByNet build_route_requests_by_net(
 struct IndexedRouteRecord {
   std::streamoff file_offset = 0;
   std::size_t line_number = 0;
+  std::size_t line_size = 0;
+  std::uint64_t line_hash = 0;
   bool routed = false;
-  bool has_reached_sink = false;
+  bool present = false;
+  bool reconstructed = false;
 };
+
+std::uint64_t hash_route_line(std::string_view line) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const unsigned char byte : line) {
+    hash ^= static_cast<std::uint64_t>(byte);
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
 
 class IndexedRoutesJsonl {
  public:
@@ -1717,7 +1949,6 @@ class IndexedRoutesJsonl {
       const std::filesystem::path& path,
       std::size_t expected_route_count,
       const RouteRequestsByNet& requests_by_net,
-      std::uint64_t edge_attr_count,
       const std::optional<routing::interchange::InterchangeArtifactPairId>&
           metadata_id,
       const std::optional<routing::interchange::InterchangeArtifactPairId>&
@@ -1735,7 +1966,10 @@ class IndexedRoutesJsonl {
                                path_.string());
     }
 
-    records_.reserve(expected_route_count);
+    // Records are dense in metadata route-request order.  Net names remain
+    // owned by metadata and the lookup map borrows them as string_views,
+    // avoiding a second copied-key hash table in the route index.
+    records_.resize(expected_route_count);
     std::string line;
     std::size_t line_number = 0;
     std::uint64_t file_offset = 0;
@@ -1752,36 +1986,33 @@ class IndexedRoutesJsonl {
         continue;
       }
 
-      NetRoute route = parse_indexed_line(line, line_number);
+      RouteIndexHeader header = parse_indexed_header(line, line_number);
       routing::interchange::require_matching_interchange_pair_ids(
-          route.artifact_pair_id, metadata_id_, publication_id_);
-      if (requests_by_net.find(route.net) == requests_by_net.end()) {
+          header.artifact_pair_id, metadata_id_, publication_id_);
+      const auto request = requests_by_net.find(header.net);
+      if (request == requests_by_net.end()) {
         throw std::runtime_error(
             "route file contains net not present in metadata: " +
-            route.net);
-      }
-      for (const RouteEdge& edge : route.edges) {
-        if (edge.csr_edge >= edge_attr_count) {
-          throw std::runtime_error(
-              "route edge references an invalid CSR edge for net " +
-              route.net);
-        }
+            header.net);
       }
       if (line_offset > static_cast<std::uint64_t>(
                             std::numeric_limits<std::streamoff>::max())) {
         throw std::runtime_error("routes file offset exceeds stream range");
       }
-      const IndexedRouteRecord record{
-          static_cast<std::streamoff>(line_offset), line_number, route.routed,
-          route.reached_sink_count != 0};
-      if (!records_.emplace(route.net, record).second) {
+      IndexedRouteRecord& record = records_[request->second];
+      if (record.present) {
         throw std::runtime_error("duplicate route entry for net: " +
-                                 route.net);
+                                 header.net);
       }
-      has_route_strings_ =
-          has_route_strings_ || record.has_reached_sink;
+      record.file_offset = static_cast<std::streamoff>(line_offset);
+      record.line_number = line_number;
+      record.line_size = line.size();
+      record.line_hash = hash_route_line(line);
+      record.routed = header.routed;
+      record.present = true;
+      ++record_count_;
     }
-    if (records_.empty() && expected_route_count != 0) {
+    if (record_count_ == 0 && expected_route_count != 0) {
       throw std::runtime_error("routes file is empty: " + path_.string());
     }
     if (!in_.eof()) {
@@ -1790,14 +2021,21 @@ class IndexedRoutesJsonl {
     }
   }
 
-  const std::unordered_map<std::string, IndexedRouteRecord>& records() const {
+  const std::vector<IndexedRouteRecord>& records() const {
     return records_;
   }
 
-  bool has_route_strings() const { return has_route_strings_; }
+  std::vector<IndexedRouteRecord>& records() { return records_; }
+
+  std::size_t record_count() const { return record_count_; }
+
+  bool has_route_strings() const { return record_count_ != 0; }
 
   NetRoute load(const std::string& expected_net,
-                const IndexedRouteRecord& record) {
+                const IndexedRouteRecord& record,
+                std::vector<std::string>& strings,
+                std::unordered_map<std::string, std::uint32_t>&
+                    string_to_index) {
     in_.clear();
     in_.seekg(record.file_offset, std::ios::beg);
     if (!in_) {
@@ -1809,11 +2047,16 @@ class IndexedRoutesJsonl {
       throw std::runtime_error("failed while rereading routes JSONL line " +
                                std::to_string(record.line_number));
     }
-    NetRoute route = parse_indexed_line(line, record.line_number);
+    if (line.size() != record.line_size ||
+        hash_route_line(line) != record.line_hash) {
+      throw std::runtime_error(
+          "routes file changed while reconstruction was in progress");
+    }
+    NetRoute route =
+        parse_indexed_line(line, record.line_number, strings, string_to_index);
     routing::interchange::require_matching_interchange_pair_ids(
         route.artifact_pair_id, metadata_id_, publication_id_);
-    if (route.net != expected_net || route.routed != record.routed ||
-        (route.reached_sink_count != 0) != record.has_reached_sink) {
+    if (route.net != expected_net || route.routed != record.routed) {
       throw std::runtime_error(
           "routes file changed while reconstruction was in progress");
     }
@@ -1821,10 +2064,24 @@ class IndexedRoutesJsonl {
   }
 
  private:
-  NetRoute parse_indexed_line(const std::string& line,
-                              std::size_t line_number) const {
+  RouteIndexHeader parse_indexed_header(const std::string& line,
+                                        std::size_t line_number) const {
     try {
-      return parse_route_line(line);
+      return JsonParser(line).parse_route_index_header();
+    } catch (const std::exception& ex) {
+      throw std::runtime_error(
+          "invalid routes JSONL line " + std::to_string(line_number) +
+          ": " + ex.what());
+    }
+  }
+
+  NetRoute parse_indexed_line(const std::string& line,
+                              std::size_t line_number,
+                              std::vector<std::string>& strings,
+                              std::unordered_map<std::string, std::uint32_t>&
+                                  string_to_index) const {
+    try {
+      return parse_route_line(line, strings, string_to_index);
     } catch (const std::exception& ex) {
       throw std::runtime_error(
           "invalid routes JSONL line " + std::to_string(line_number) +
@@ -1838,8 +2095,8 @@ class IndexedRoutesJsonl {
       publication_id_;
   std::vector<char> io_buffer_;
   std::ifstream in_;
-  std::unordered_map<std::string, IndexedRouteRecord> records_;
-  bool has_route_strings_ = false;
+  std::vector<IndexedRouteRecord> records_;
+  std::size_t record_count_ = 0;
 };
 
 class RouteEdgeMetadataReader {
@@ -1964,14 +2221,16 @@ void validate_route_index(const IndexedRoutesJsonl& routes,
                           const RoutingMetadataSummary& metadata,
                           bool allow_unrouted_stubs) {
   if (!allow_unrouted_stubs) {
-    for (const MetadataRouteRequest& request : metadata.route_requests) {
-      const auto route = routes.records().find(request.net);
-      if (route == routes.records().end()) {
+    for (std::size_t index = 0; index < metadata.route_requests.size();
+         ++index) {
+      const MetadataRouteRequest& request = metadata.route_requests[index];
+      const IndexedRouteRecord& route = routes.records()[index];
+      if (!route.present) {
         throw std::runtime_error(
             "strict routing is missing a route entry for net: " +
             request.net);
       }
-      if (!route->second.routed) {
+      if (!route.routed) {
         throw std::runtime_error(
             "strict routing contains an unrouted net: " + request.net);
       }
@@ -1984,7 +2243,8 @@ void validate_route_against_metadata(
     const MetadataRouteRequest& request,
     const RoutingMetadataSummary& metadata,
     const std::unordered_map<std::uint64_t, MetadataRouteEdge>&
-        route_edge_metadata) {
+        route_edge_metadata,
+    const std::vector<std::string>& physical_strings) {
   const auto node_pair_key = [](int from, int to) {
     return (static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(from))
@@ -1993,6 +2253,13 @@ void validate_route_against_metadata(
   };
 
   const std::string& net = route.net;
+  const auto route_string = [&](std::uint32_t index) -> const std::string& {
+    if (index == kNoPhysicalString || index >= physical_strings.size()) {
+      throw std::runtime_error(
+          "route references an invalid PhysicalNetlist string index");
+    }
+    return physical_strings[index];
+  };
   if (route.sources.size() != request.sources.size()) {
     std::ostringstream out;
     out << "route source count for " << net << " is "
@@ -2113,7 +2380,8 @@ void validate_route_against_metadata(
       throw std::runtime_error(
           "route edge is missing attachment/site fields for net " + net);
     }
-    if (edge.attachment.has_value() != edge.site.has_value()) {
+    const bool has_site = edge.site != kNoPhysicalString;
+    if (edge.attachment.has_value() != has_site) {
       throw std::runtime_error(
           "route edge must pair attachment and site for net " + net);
     }
@@ -2124,9 +2392,12 @@ void validate_route_against_metadata(
           "route edge has no compact metadata record for net " + net);
     }
     const MetadataRouteEdge& expected_edge = compact_edge->second;
-    if (edge.tile != string_at(metadata, expected_edge.tile_string) ||
-        edge.wire0 != string_at(metadata, expected_edge.wire0_string) ||
-        edge.wire1 != string_at(metadata, expected_edge.wire1_string) ||
+    if (route_string(edge.tile) !=
+            string_at(metadata, expected_edge.tile_string) ||
+        route_string(edge.wire0) !=
+            string_at(metadata, expected_edge.wire0_string) ||
+        route_string(edge.wire1) !=
+            string_at(metadata, expected_edge.wire1_string) ||
         edge.forward != expected_edge.forward) {
       throw std::runtime_error(
           "route edge does not match compact metadata for net " + net);
@@ -2135,7 +2406,7 @@ void validate_route_against_metadata(
     const auto endpoint_for_edge =
         metadata.endpoint_pip_by_csr_edge.find(edge.csr_edge);
     if (endpoint_for_edge == metadata.endpoint_pip_by_csr_edge.end()) {
-      if (edge.attachment.has_value() || edge.site.has_value()) {
+      if (edge.attachment.has_value() || has_site) {
         throw std::runtime_error(
             "conventional route edge must not carry attachment/site for net " +
             net);
@@ -2144,7 +2415,7 @@ void validate_route_against_metadata(
     }
 
     const std::size_t expected_index = endpoint_for_edge->second;
-    if (!edge.attachment.has_value() || !edge.site.has_value()) {
+    if (!edge.attachment.has_value() || !has_site) {
       throw std::runtime_error(
           "endpoint attachment edge is encoded as conventional for net " +
           net);
@@ -2165,11 +2436,13 @@ void validate_route_against_metadata(
         metadata.endpoint_pips[expected_index];
     if (edge.from != endpoint.from || edge.to != endpoint.to ||
         edge.csr_edge != endpoint.csr_edge ||
-        edge.tile != string_at(metadata, endpoint.tile_string) ||
-        edge.wire0 != string_at(metadata, endpoint.wire0_string) ||
-        edge.wire1 != string_at(metadata, endpoint.wire1_string) ||
+        route_string(edge.tile) != string_at(metadata, endpoint.tile_string) ||
+        route_string(edge.wire0) !=
+            string_at(metadata, endpoint.wire0_string) ||
+        route_string(edge.wire1) !=
+            string_at(metadata, endpoint.wire1_string) ||
         edge.forward != endpoint.forward ||
-        *edge.site != string_at(metadata, endpoint.site_string)) {
+        route_string(edge.site) != string_at(metadata, endpoint.site_string)) {
       throw std::runtime_error(
           "route attachment does not exactly match sparse metadata for net " +
           net);
@@ -2472,7 +2745,7 @@ std::vector<std::string> copy_string_list(
   return strings;
 }
 
-std::uint32_t string_index(const std::string& text,
+std::uint32_t string_index(std::string text,
                            std::vector<std::string>& strings,
                            std::unordered_map<std::string, std::uint32_t>& string_to_index) {
   const auto found = string_to_index.find(text);
@@ -2481,7 +2754,7 @@ std::uint32_t string_index(const std::string& text,
     throw std::runtime_error("PhysicalNetlist strList exceeds uint32_t");
   }
   const std::uint32_t index = static_cast<std::uint32_t>(strings.size());
-  strings.push_back(text);
+  strings.push_back(std::move(text));
   string_to_index.emplace(strings.back(), index);
   return index;
 }
@@ -2632,17 +2905,10 @@ void collect_site_pin_branches(
   }
 }
 
-struct PreparedRouteEdge {
-  int to = -1;
-  std::uint32_t tile = 0;
-  std::uint32_t wire0 = 0;
-  std::uint32_t wire1 = 0;
-  bool forward = true;
-  std::uint32_t site = kNoPhysicalString;
-};
-
 struct RouteTables {
-  std::unordered_map<int, std::vector<PreparedRouteEdge>> children_by_node;
+  // Pointers remain valid for the lifetime of the current NetRoute and avoid
+  // duplicating every parsed edge into a second prepared-edge allocation.
+  std::unordered_map<int, std::vector<const RouteEdge*>> children_by_node;
   std::unordered_map<int, std::vector<std::uint64_t>> sinks_by_node;
   std::unordered_map<std::uint64_t, int> source_node_by_pin;
   std::size_t edge_count = 0;
@@ -2659,16 +2925,7 @@ RouteTables build_route_tables(
   tables.source_node_by_pin.reserve(route.sources.size());
 
   for (const RouteEdge& route_edge : route.edges) {
-    PreparedRouteEdge edge;
-    edge.to = route_edge.to;
-    edge.tile = string_index(route_edge.tile, strings, string_to_index);
-    edge.wire0 = string_index(route_edge.wire0, strings, string_to_index);
-    edge.wire1 = string_index(route_edge.wire1, strings, string_to_index);
-    edge.forward = route_edge.forward;
-    if (route_edge.site.has_value()) {
-      edge.site = string_index(*route_edge.site, strings, string_to_index);
-    }
-    tables.children_by_node[route_edge.from].push_back(edge);
+    tables.children_by_node[route_edge.from].push_back(&route_edge);
     ++tables.edge_count;
   }
   for (const RouteSitePin& source : route.sources) {
@@ -2700,38 +2957,69 @@ std::size_t insert_route_tree(
     const NetRoute& route,
     const RouteTables& tables,
     StubBranchStore& stub_store,
-    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Builder old_stubs,
-    std::unordered_set<int>& active_nodes) {
-  if (!active_nodes.insert(node).second) {
-    throw std::runtime_error("route tree has a cycle in net: " + route.net);
-  }
+    capnp::List<PhysicalNetlist::PhysNetlist::RouteBranch>::Builder old_stubs) {
+  using RouteBranch = PhysicalNetlist::PhysNetlist::RouteBranch;
+  using EdgeList = std::vector<const RouteEdge*>;
+  using SinkList = std::vector<std::uint64_t>;
+  struct DfsFrame {
+    int node = -1;
+    capnp::List<RouteBranch>::Builder output;
+    const EdgeList* edges = nullptr;
+    const SinkList* sinks = nullptr;
+    std::size_t next_edge = 0;
+    std::size_t next_sink = 0;
+    std::uint32_t output_index = 0;
+  };
 
-  const auto children_it = tables.children_by_node.find(node);
-  const auto sinks_it = tables.sinks_by_node.find(node);
-  const std::size_t child_count =
-      children_it == tables.children_by_node.end() ? 0 : children_it->second.size();
-  const std::size_t sink_count =
-      sinks_it == tables.sinks_by_node.end() ? 0 : sinks_it->second.size();
-  const std::size_t branch_count = child_count + sink_count;
-  if (branch_count == 0) {
-    active_nodes.erase(node);
-    return 0;
-  }
-  if (branch_count > std::numeric_limits<std::uint32_t>::max()) {
-    throw std::runtime_error("route branch fanout exceeds uint32 in net: " +
-                             route.net);
-  }
-  if (branch.getBranches().size() != 0) {
-    throw std::runtime_error("source route branch already has children in net: " + route.net);
-  }
+  std::vector<DfsFrame> stack;
+  std::unordered_set<int> active_path;
+  const auto push_node = [&](RouteBranch::Builder output_branch,
+                             int output_node) {
+    if (!active_path.insert(output_node).second) {
+      throw std::runtime_error("route tree has a cycle in net: " + route.net);
+    }
+    const auto children = tables.children_by_node.find(output_node);
+    const auto sinks = tables.sinks_by_node.find(output_node);
+    const EdgeList* edge_list =
+        children == tables.children_by_node.end() ? nullptr
+                                                  : &children->second;
+    const SinkList* sink_list =
+        sinks == tables.sinks_by_node.end() ? nullptr : &sinks->second;
+    const std::size_t edge_count = edge_list == nullptr ? 0 : edge_list->size();
+    const std::size_t sink_count = sink_list == nullptr ? 0 : sink_list->size();
+    if (sink_count > std::numeric_limits<std::uint32_t>::max() ||
+        edge_count >
+            std::numeric_limits<std::uint32_t>::max() - sink_count) {
+      throw std::runtime_error("route node has too many branches in net: " +
+                               route.net);
+    }
+    const std::size_t branch_count = edge_count + sink_count;
+    if (branch_count == 0) {
+      active_path.erase(output_node);
+      return;
+    }
+    if (output_branch.getBranches().size() != 0) {
+      throw std::runtime_error(
+          "source route branch already has children in net: " + route.net);
+    }
+    DfsFrame frame;
+    frame.node = output_node;
+    frame.output = output_branch.initBranches(
+        static_cast<std::uint32_t>(branch_count));
+    frame.edges = edge_list;
+    frame.sinks = sink_list;
+    stack.push_back(frame);
+  };
 
-  auto new_branches = branch.initBranches(static_cast<std::uint32_t>(branch_count));
-  std::uint32_t out_index = 0;
   std::size_t emitted_edges = 0;
-
-  if (children_it != tables.children_by_node.end()) {
-    for (const PreparedRouteEdge& edge : children_it->second) {
-      auto child = new_branches[out_index++];
+  push_node(branch, node);
+  while (!stack.empty()) {
+    DfsFrame& frame = stack.back();
+    const std::size_t edge_count =
+        frame.edges == nullptr ? 0 : frame.edges->size();
+    if (frame.next_edge < edge_count) {
+      const RouteEdge& edge = *(*frame.edges)[frame.next_edge++];
+      auto child = frame.output[frame.output_index++];
       auto pip = child.initRouteSegment().initPip();
       pip.setTile(edge.tile);
       pip.setWire0(edge.wire0);
@@ -2746,25 +3034,24 @@ std::size_t insert_route_tree(
         // Select the union arm explicitly; do not rely on schema defaults.
         pip.setNoSite();
       }
-      emitted_edges += 1 + insert_route_tree(child,
-                                             edge.to,
-                                             route,
-                                             tables,
-                                             stub_store,
-                                             old_stubs,
-                                             active_nodes);
+      ++emitted_edges;
+      push_node(child, edge.to);
+      continue;
     }
-  }
 
-  if (sinks_it != tables.sinks_by_node.end()) {
-    for (const std::uint64_t sink : sinks_it->second) {
-      auto child = new_branches[out_index++];
-      copy_route_branch(old_stubs[consume_stub_branch(stub_store, sink, route.net)],
-                        child);
+    const std::size_t sink_count =
+        frame.sinks == nullptr ? 0 : frame.sinks->size();
+    if (frame.next_sink < sink_count) {
+      const std::uint64_t sink = (*frame.sinks)[frame.next_sink++];
+      auto child = frame.output[frame.output_index++];
+      copy_route_branch(
+          old_stubs[consume_stub_branch(stub_store, sink, route.net)], child);
+      continue;
     }
-  }
 
-  active_nodes.erase(node);
+    active_path.erase(frame.node);
+    stack.pop_back();
+  }
   return emitted_edges;
 }
 
@@ -2801,28 +3088,26 @@ void write_routed_phys(const std::filesystem::path& input_phys,
                        canonical_string_index,
                        routes.has_route_strings() ? kStringReserveHeadroom : 0);
 
-  std::unordered_set<const IndexedRouteRecord*> routed_seen;
-  routed_seen.reserve(routes.records().size());
-
   auto phys_nets = netlist.getPhysNets();
   for (std::uint32_t net_index = 0; net_index < phys_nets.size(); ++net_index) {
     auto net = phys_nets[net_index];
     const std::string& physical_net_name =
         phys_string_at(strings, net.getName());
-    const auto route_it = routes.records().find(physical_net_name);
-    if (route_it == routes.records().end()) continue;
+    const auto request = requests_by_net.find(physical_net_name);
+    if (request == requests_by_net.end()) continue;
+    const std::size_t request_index = request->second;
+    IndexedRouteRecord& indexed_route = routes.records()[request_index];
+    if (!indexed_route.present) continue;
 
-    NetRoute route = routes.load(route_it->first, route_it->second);
-    const std::string& net_name = route_it->first;
-    const auto request = requests_by_net.find(net_name);
-    if (request == requests_by_net.end()) {
-      throw std::runtime_error(
-          "route file contains net not present in metadata: " + net_name);
-    }
+    const MetadataRouteRequest& metadata_request =
+        metadata.route_requests[request_index];
+    const std::string& net_name = metadata_request.net;
+    NetRoute route = routes.load(net_name, indexed_route, strings,
+                                 string_to_index);
     const auto route_edge_metadata =
         route_metadata_reader.load_for_route(route);
-    validate_route_against_metadata(route, *request->second, metadata,
-                                    route_edge_metadata);
+    validate_route_against_metadata(route, metadata_request, metadata,
+                                    route_edge_metadata, strings);
 
     const bool reached_any_sink = route.reached_sink_count != 0;
     if (!reached_any_sink) {
@@ -2834,7 +3119,7 @@ void write_routed_phys(const std::filesystem::path& input_phys,
         throw std::runtime_error("unrouted route has no reached sinks: " +
                                  net_name);
       }
-      routed_seen.insert(&route_it->second);
+      indexed_route.reconstructed = true;
       continue;
     }
 
@@ -2858,9 +3143,7 @@ void write_routed_phys(const std::filesystem::path& input_phys,
 
     std::size_t emitted_edges = 0;
     std::unordered_set<int> emitted_source_nodes;
-    std::unordered_set<int> active_nodes;
     emitted_source_nodes.reserve(route.sources.size());
-    active_nodes.reserve(std::min<std::size_t>(route.edges.size(), 1024));
     for (const auto& [source_key, source_branch] : source_branches) {
       const auto source_node_it = tables.source_node_by_pin.find(source_key);
       if (source_node_it == tables.source_node_by_pin.end()) continue;
@@ -2881,8 +3164,7 @@ void write_routed_phys(const std::filesystem::path& input_phys,
                                          route,
                                          tables,
                                          stub_store,
-                                         old_stubs,
-                                         active_nodes);
+                                         old_stubs);
     }
 
     if (emitted_edges != tables.edge_count) {
@@ -2909,12 +3191,15 @@ void write_routed_phys(const std::filesystem::path& input_phys,
       if (stub.consumed) continue;
       copy_route_branch(old_stubs[stub.branch_index], new_stubs[stub_index++]);
     }
-    routed_seen.insert(&route_it->second);
+    indexed_route.reconstructed = true;
   }
 
-  for (const auto& [net, route] : routes.records()) {
-    if (routed_seen.find(&route) == routed_seen.end()) {
-      throw std::runtime_error("route net was not found in PhysicalNetlist: " + net);
+  for (std::size_t index = 0; index < routes.records().size(); ++index) {
+    const IndexedRouteRecord& route = routes.records()[index];
+    if (route.present && !route.reconstructed) {
+      throw std::runtime_error(
+          "route net was not found in PhysicalNetlist: " +
+          metadata.route_requests[index].net);
     }
   }
 
@@ -2975,8 +3260,7 @@ int main(int argc, char** argv) {
         build_route_requests_by_net(metadata);
     IndexedRoutesJsonl routes(
         routes_path, metadata.route_requests.size(), requests_by_net,
-        metadata.edge_attr_count, metadata.artifact_pair_id,
-        publication_snapshot.generation);
+        metadata.artifact_pair_id, publication_snapshot.generation);
     validate_route_index(routes, metadata, allow_unrouted_stubs);
     RouteEdgeMetadataReader route_metadata_reader(metadata_path, metadata);
     routing::interchange::verify_interchange_publication(

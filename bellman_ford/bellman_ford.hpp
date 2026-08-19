@@ -52,7 +52,8 @@ struct BellmanFordWorkspaceOptions {
   bool diagnostics = false;
   // Explicit-stream controllers enqueue this many relaxation/finalize rounds
   // before copying controller status to the host. Supported values are
-  // 1, 2, 4, 8, and 16; one is the baseline/control path.
+  // 1, 2, 4, 8, and 16. One remains the direct-workspace compatibility
+  // default; PathFinder supplies its separate eight-round routing default.
   int segment_rounds = 1;
   BellmanFordHipGraphMode hip_graph_mode =
       BellmanFordHipGraphMode::kAuto;

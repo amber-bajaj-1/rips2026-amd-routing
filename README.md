@@ -50,6 +50,21 @@ Each run shows compact progress bars and wall-clock times for conversion,
 loading, GPU upload, routing, and reconstruction. Detailed diagnostics are
 hidden by default.
 
+Routing uses four independent net workers by default. Bellman-Ford batches
+eight relaxation rounds per explicit-stream segment and uses an adaptive reset
+threshold of `0.25`. These are defaults rather than forced arguments, so an
+explicit command-line value still takes precedence. For example:
+
+```bash
+make run \
+  BENCHMARK=logicnets_jscl \
+  PATHFINDER_ARGS='--parallel-net-workers 2 --bellman-ford-segment-rounds 4 --bellman-ford-adaptive-reset-threshold 0.5'
+```
+
+Pass `--parallel-net-workers 0` to opt into hardware- and workload-aware
+automatic worker selection. Pass `--bellman-ford-segment-rounds 1` to select
+the one-round Bellman-Ford compatibility path.
+
 ## Route your own files
 
 Provide the input PhysicalNetlist, logical netlist, and output path:

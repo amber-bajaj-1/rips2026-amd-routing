@@ -410,8 +410,9 @@ struct Recommendation {
       WorkspaceCostStorageMode::kIdentity;
 };
 
-// Recommend only the automatic count. An explicit --parallel-net-workers N
-// override is resolved by PathFinder before/after this pure policy function.
+// Recommend only the opt-in automatic count. PathFinder's generic default is
+// four workers; --parallel-net-workers 0 selects this policy, while any
+// positive count bypasses it and remains an explicit fixed worker count.
 // Unmeasured architectures remain at one worker until target evidence supports
 // a larger plateau; gfx1151 uses the measured smallest-plateau preference of
 // three when every resource ceiling permits it.

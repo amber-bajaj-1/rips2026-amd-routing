@@ -297,9 +297,11 @@ void validate_options(const PathfinderOptions& options) {
     case SsspEngine::kDeltaStep:
       if (options.bellman_ford_diagnostics ||
           options.bellman_ford_target_check_interval != 1 ||
-          options.bellman_ford_segment_rounds != 1 ||
+          options.bellman_ford_segment_rounds !=
+              PathfinderOptions::kDefaultBellmanFordSegmentRounds ||
           options.bellman_ford_hip_graph_mode != BellmanFordHipGraphMode::kAuto ||
-          options.bellman_ford_adaptive_reset_threshold != 0.25) {
+          options.bellman_ford_adaptive_reset_threshold !=
+              PathfinderOptions::kDefaultBellmanFordAdaptiveResetThreshold) {
         throw std::invalid_argument(
             "Bellman-Ford controls cannot be applied to "
             "Delta-Stepping");
@@ -1884,14 +1886,14 @@ void print_usage(const char* program) {
       << "  --bellman-ford-target-check-interval <int>\n"
       << "                                  Target-certificate interval. Default: 1\n"
       << "  --bellman-ford-segment-rounds <1|2|4|8|16>\n"
-      << "                                  Explicit-stream segment size. Default: 1\n"
+      << "                                  Explicit-stream segment size. Default: 8\n"
       << "  --bellman-ford-hip-graph <auto|on|off> HIP Graph replay policy. Default: auto\n"
       << "  --bellman-ford-adaptive-reset-threshold <fraction>\n"
       << "                                  Dense reset threshold in (0, 1]. Default: 0.25\n"
       << "  --bellman-ford-diagnostics      Emit one aggregate Bellman-Ford diagnostics JSON record.\n"
       << "  --capacity <int>                Capacity used only for overuse diagnostics. Default: 1\n"
       << "  --net-limit <count>             Route only the first count requests.\n"
-      << "  --parallel-net-workers <count>  Independent net workers. Default: 0 (automatic).\n"
+      << "  --parallel-net-workers <count>  Independent net workers. Default: 4; 0 selects automatic.\n"
       << "  --concise                       Show progress and component timings only (default).\n"
       << "  --verbose                       Show detailed routing diagnostics.\n"
       << "  --allow-unrouted                Write partial routes even if some sinks are unreached.\n"

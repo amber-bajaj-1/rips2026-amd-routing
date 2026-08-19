@@ -66,7 +66,7 @@ PREPROCESS_HEADERS := \
 	pre-process/import_policy.hpp
 
 .PHONY: all router pipeline interchange-tools device-graph validation \
-	help run clean
+	test-routes-to-phys help run clean
 
 all: router
 
@@ -142,6 +142,21 @@ routes_to_phys: \
 		"$(SCHEMA_DIR)/References.capnp.c++" \
 		$(INTERCHANGE_LIBS) -o $@
 
+routes_to_phys_test: \
+		post-process/routes_to_phys_test.cpp \
+		post-process/routes_to_phys.cpp \
+		pre-process/gzip_io.hpp \
+		pre-process/import_policy.hpp
+	$(require_schema_dir)
+	$(CXX) $(CXX_FLAGS) $(INTERCHANGE_CPPFLAGS) -I"$(SCHEMA_DIR)" \
+		post-process/routes_to_phys_test.cpp \
+		"$(SCHEMA_DIR)/PhysicalNetlist.capnp.c++" \
+		"$(SCHEMA_DIR)/References.capnp.c++" \
+		$(INTERCHANGE_LIBS) -o $@
+
+test-routes-to-phys: routes_to_phys_test
+	./routes_to_phys_test
+
 define require_run_inputs
 	@test -n "$(strip $(INPUT_PHYS))" || \
 		{ echo "Set BENCHMARK=<name>, or set INPUT_PHYS and LOGICAL_NETLIST explicitly."; exit 2; }
@@ -174,10 +189,14 @@ help:
 	@echo
 	@echo "Build the full conversion/routing/reconstruction pipeline:"
 	@echo "  make pipeline"
+	@echo "  make test-routes-to-phys"
 	@echo
 	@echo "Run a bundled benchmark:"
 	@echo "  make run BENCHMARK=logicnets_jscl"
 	@echo "  Bellman-Ford is the default engine."
+	@echo "  Routing defaults to 4 net workers; Bellman-Ford uses 8-round segments and a 0.25 adaptive-reset threshold."
+	@echo "  Override with PATHFINDER_ARGS='--parallel-net-workers 2 --bellman-ford-segment-rounds 4 --bellman-ford-adaptive-reset-threshold 0.5'."
+	@echo "  Use PATHFINDER_ARGS='--parallel-net-workers 0' for automatic worker selection."
 	@echo "  make run BENCHMARK=logicnets_jscl PATHFINDER_SSSP_ENGINE=delta-step"
 	@echo "  For Delta-Stepping, DELTA defaults to 1; use DELTA=auto or DELTA=<positive-number> to override it."
 	@echo "  Both engines are bounded by default with X=2, Y=14 margins and one unbounded fallback."
@@ -190,4 +209,4 @@ help:
 
 clean:
 	rm -f PathFinderFile pathfinder interchange_to_csr \
-		device_to_routing_graph routes_to_phys
+		device_to_routing_graph routes_to_phys routes_to_phys_test

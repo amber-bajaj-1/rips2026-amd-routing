@@ -132,6 +132,10 @@ struct RoutedNet {
 };
 
 struct PathfinderOptions {
+  static constexpr std::size_t kDefaultParallelNetWorkers = 4;
+  static constexpr int kDefaultBellmanFordSegmentRounds = 8;
+  static constexpr double kDefaultBellmanFordAdaptiveResetThreshold = 0.25;
+
   SsspEngine sssp_engine = SsspEngine::kBellmanFord;
   // Keep progress and component timings while hiding configuration details.
   bool concise_output = true;
@@ -139,8 +143,9 @@ struct PathfinderOptions {
   int max_sssp_iterations = -1;
   int capacity = 1;
   std::size_t net_limit = 0;
-  // Zero enables automatic worker selection.
-  std::size_t parallel_net_workers = 0;
+  // Four workers is the generic routing default. Zero remains an explicit
+  // request for hardware- and workload-aware automatic selection.
+  std::size_t parallel_net_workers = kDefaultParallelNetWorkers;
   // A numeric delta remains an explicit override.
   bool delta_auto = false;
   float delta_multiplier = 1.0f;
@@ -160,10 +165,11 @@ struct PathfinderOptions {
   RoutingBoundsConfig bounds{};
   int bellman_ford_target_check_interval = 1;
   bool bellman_ford_diagnostics = false;
-  int bellman_ford_segment_rounds = 1;
+  int bellman_ford_segment_rounds = kDefaultBellmanFordSegmentRounds;
   BellmanFordHipGraphMode bellman_ford_hip_graph_mode =
       BellmanFordHipGraphMode::kAuto;
-  double bellman_ford_adaptive_reset_threshold = 0.25;
+  double bellman_ford_adaptive_reset_threshold =
+      kDefaultBellmanFordAdaptiveResetThreshold;
 };
 
 struct PathfinderResult {

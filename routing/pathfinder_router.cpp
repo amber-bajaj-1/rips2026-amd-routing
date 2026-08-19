@@ -299,14 +299,14 @@ void print_usage(const char* program) {
       << "  --bellman-ford-target-check-interval <positive-int>\n"
       << "                                 Forward Bellman-Ford target polling interval.\n"
       << "  --bellman-ford-segment-rounds <1|2|4|8|16>\n"
-      << "                                 Forward explicit-stream segment size.\n"
+      << "                                 Forward explicit-stream segment size. Default: 8\n"
       << "  --bellman-ford-hip-graph <auto|on|off> Forward HIP Graph replay policy.\n"
       << "  --bellman-ford-adaptive-reset-threshold <fraction>\n"
-      << "                                 Forward dense reset threshold in (0, 1].\n"
+      << "                                 Forward dense reset threshold in (0, 1]. Default: 0.25\n"
       << "  --bellman-ford-diagnostics     Forward opt-in Bellman-Ford diagnostics.\n"
       << "  --max-sssp-iters <int>         Forwarded to pathfinder.\n"
       << "  --net-limit <count>            Forwarded to pathfinder.\n"
-      << "  --parallel-net-workers <count> Forwarded to pathfinder; 0 enables automatic selection.\n"
+      << "  --parallel-net-workers <count> Forwarded to pathfinder. Default: 4; 0 selects automatic.\n"
       << "  --capacity <int>               Forwarded for overuse diagnostics.\n";
 }
 
