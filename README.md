@@ -1,6 +1,6 @@
 # RIPS AMD routing
 
-This repository was created as part of UCLA's Institute for Pure and Applied Mathematics (IPAM) Research in Industrial Projects for Students (RIPS) program for Advanced Micro Devices (AMD). The project centered around implementing Bellman-Ford and Delta-Stepping as routing algorithms on AMD client GPUs, with the goal of speeding up FPGA routing. 
+This repository was created as part of Institute for Pure and Applied Mathematics (IPAM) Research in Industrial Projects for Students (RIPS) program for Advanced Micro Devices (AMD). IPAM is an NSF institute at UCLA. The project centered around implementing Bellman-Ford and Delta-Stepping as routing algorithms on AMD client GPUs, with the goal of speeding up FPGA routing. 
 
 Documentation on how to run and validate the program files are below. The 4 benchmarks included in this repository come from RapidWright's 2024 Runtime-First FPGA Interchange Routing Contest. 
 
