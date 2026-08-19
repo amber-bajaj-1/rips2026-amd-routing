@@ -6,7 +6,7 @@ Documentation on how to run and validate the program files are below. The 4 benc
 
 ## Set up
 
-Run the setup script on an AMD University Program image with ROCm installed:
+Run the setup script in a GPU environment with ROCm installed:
 
 ```bash
 HOME_DIRECTORY="${HOME}"
