@@ -5,8 +5,7 @@ This repository was created as part of Institute for Pure and Applied Mathematic
 Documentation on how to run and validate the program files are below. The 4 benchmarks included in this repository come from RapidWright's 2024 Runtime-First FPGA Interchange Routing Contest. 
 
 ## Set up
-
-Run the setup script in a GPU environment with ROCm installed:
+Upload `setup.sh` into an AMD GPU environment with ROCm installed. Then run the setup script: 
 
 ```bash
 HOME_DIRECTORY="${HOME}"
