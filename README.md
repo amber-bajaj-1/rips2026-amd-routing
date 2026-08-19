@@ -108,7 +108,7 @@ validation/validate_routes \
 
 Validation prints stage timings and periodic shortest-path progress by default.
 The shortest-path optimality stage checks one out of every 1,000 nets, starting
-with the first. This keeps validation practical on the larger benchmarks while
+with the first. This keeps validation practical on larger benchmarks while
 still comparing sampled routes against the full routing graph.
 
 ## Optional arguments
